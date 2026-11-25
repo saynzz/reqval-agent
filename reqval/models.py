@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .criteria import normalize_code
 
 # ---------------------------------------------------------------------------
 # Документ
@@ -68,6 +70,11 @@ class Location:
 
 Severity = Literal["критичный", "значительный", "незначительный"]
 
+# Коды критериев — закрытый список (enum в JSON-схеме). Код вне справочника выпадал бы из матрицы
+# соответствия, и отчёт противоречил бы сам себе.
+ReqCriterion = Literal["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
+SetCriterion = Literal["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"]
+
 
 @dataclass
 class Requirement:
@@ -113,12 +120,14 @@ class LLMExtraction(BaseModel):
 
 
 class LLMIssue(BaseModel):
-    criterion: str = Field(description="Код критерия, например C3")
+    criterion: ReqCriterion = Field(description="Код критерия отдельного требования C1–C9")
     severity: Literal["критичный", "значительный", "незначительный"]
     title: str = Field(description="Короткое название дефекта")
     quote: str = Field(description="ДОСЛОВНЫЙ фрагмент документа, к которому относится дефект")
     explanation: str = Field(description="В чём дефект и почему это нарушение критерия")
     recommendation: str = Field(description="Как переформулировать/исправить")
+
+    _norm_criterion = field_validator("criterion", mode="before")(normalize_code)
 
 
 class LLMReqAssessment(BaseModel):
@@ -136,12 +145,14 @@ class LLMEvidence(BaseModel):
 
 
 class LLMSetIssue(BaseModel):
-    criterion: str
+    criterion: SetCriterion = Field(description="Код критерия набора S1–S8")
     severity: Literal["критичный", "значительный", "незначительный"]
     title: str
     explanation: str
     recommendation: str
     evidence: list[LLMEvidence]
+
+    _norm_criterion = field_validator("criterion", mode="before")(normalize_code)
 
 
 class LLMSetResult(BaseModel):

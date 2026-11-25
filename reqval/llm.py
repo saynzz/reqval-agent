@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import TypeVar
@@ -27,6 +28,7 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     seconds: float = 0.0
+    cost_usd: float = 0.0          # если провайдер сообщает стоимость (OpenRouter)
     errors: list[str] = field(default_factory=list)
 
 
@@ -175,12 +177,90 @@ class OpenAICompatProvider(BaseProvider):
         return data["choices"][0]["message"]["content"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
 
 
+def strict_json_schema(schema: type[BaseModel]) -> dict:
+    """JSON-схема pydantic-модели в виде для strict structured outputs (OpenAI / OpenRouter):
+    без $ref (определения встроены), additionalProperties=false, все поля обязательны."""
+    root = schema.model_json_schema()
+    defs = root.pop("$defs", {})
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return walk(dict(defs[node["$ref"].split("/")[-1]]))
+            node = {k: walk(v) for k, v in node.items() if k != "title"}
+            if node.get("type") == "object" and "properties" in node:
+                node["additionalProperties"] = False
+                node["required"] = list(node["properties"])
+            return node
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        return node
+
+    return walk(root)
+
+
+class OpenRouterProvider(OpenAICompatProvider):
+    """OpenRouter (https://openrouter.ai): любые модели, в т.ч. Gemini, через OpenAI-совместимый API.
+
+    В отличие от общего OpenAI-совместимого провайдера ответ запрашивается строго по JSON-схеме
+    (response_format=json_schema, strict), а запрос направляется только к хостингам, которые эту схему
+    поддерживают (provider.require_parameters). Стоимость прогона берётся из ответа OpenRouter."""
+
+    name = "OpenRouter"
+
+    def __init__(self, model: str | None = None) -> None:
+        BaseProvider.__init__(self)
+        self.base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+        self.key = os.getenv("OPENROUTER_API_KEY", "")
+        self.model = model or os.getenv("OPENROUTER_MODEL", "")
+        if not self.key or self.key.startswith("your_"):
+            raise LLMError("Не задан OPENROUTER_API_KEY (https://openrouter.ai/settings/keys)")
+        if not self.model:
+            raise LLMError("Не задан OPENROUTER_MODEL — точный id модели со страницы openrouter.ai, "
+                           "например google/gemini-3.1-pro-preview")
+
+    def _raw(self, system, prompt, schema):
+        body = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "seed": 42,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": schema.__name__, "strict": True, "schema": strict_json_schema(schema)}},
+            "provider": {"require_parameters": True},
+            "usage": {"include": True},
+        }
+        req = urllib.request.Request(self.base + "/chat/completions", data=json.dumps(body).encode(), headers={
+            "Content-Type": "application/json", "Authorization": f"Bearer {self.key}",
+            "X-Title": "reqval requirements review agent"})  # только ASCII: заголовки HTTP в latin-1
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:   # тело ошибки OpenRouter объясняет причину (ключ, баланс, модель)
+            detail = e.read().decode("utf-8", "replace")[:500]
+            err = LLMError(f"HTTP {e.code} от OpenRouter: {detail}")
+            err.code = e.code
+            raise err from e
+        if "error" in data:
+            err = LLMError(f"OpenRouter: {data['error']}")
+            err.code = (data["error"] or {}).get("code") if isinstance(data["error"], dict) else None
+            raise err
+        u = data.get("usage") or {}
+        self.usage.cost_usd += float(u.get("cost") or 0)
+        content = data["choices"][0]["message"].get("content") or ""
+        if not content:
+            raise LLMError(f"пустой ответ модели (finish_reason={data['choices'][0].get('finish_reason')})")
+        return content, u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
+
+
 def make_provider(kind: str, model: str | None) -> BaseProvider | None:
     kind = (kind or os.getenv("LLM_PROVIDER", "gemini")).lower()
     if kind == "offline":
         return None
     if kind == "gemini":
         return GeminiProvider(model)
+    if kind == "openrouter":
+        return OpenRouterProvider(model)
     if kind in ("openai", "ollama", "openai-compatible"):
         return OpenAICompatProvider(model)
     raise LLMError(f"Неизвестный провайдер: {kind}")

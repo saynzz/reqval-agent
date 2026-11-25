@@ -62,6 +62,9 @@ def build_markdown(res: RunResult) -> str:
     L += [f"# Отчёт о проверке требований: «{doc.name}»", ""]
     L += [f"> Итог: **{v.status}** · требований: **{len(reqs)}** · дефектов: **{len(fs)}** "
           f"(🔴 {sev['критичный']} · 🟠 {sev['значительный']} · 🟡 {sev['незначительный']})", ""]
+    if not res.complete:
+        gaps = res.failed_steps + ([f"нет оценки модели для {', '.join(res.unchecked)}"] if res.unchecked else [])
+        L += [f"> ⚠ **Проверка выполнена не полностью:** {'; '.join(gaps)}. Подробности — в приложении.", ""]
 
     # 1. Паспорт ---------------------------------------------------------------
     L += ["## 1. Паспорт прогона", "", "| Параметр | Значение |", "| :--- | :--- |"]
@@ -70,23 +73,35 @@ def build_markdown(res: RunResult) -> str:
         ("Файл", f"{Path(doc.path).name} ({doc.fmt.upper()}, {len(doc.lines)} строк)"),
         ("SHA-256 файла", f"`{doc.sha256}`"),
         ("Дата и время прогона", f"{res.started:%d.%m.%Y %H:%M:%S %Z} (длительность {dur:.0f} с)"),
-        ("Режим", res.mode),
+        ("Режим", res.mode + ("" if res.extraction in ("LLM", "правила") else f"; нарезка требований: {res.extraction}")),
         ("Модель", f"{p.model} ({p.name})" if p else "— (LLM не использовалась)"),
         ("Параметры модели", f"temperature={p.temperature}, seed=42, structured output (JSON-схема)" if p else "—"),
         ("Версия агента", agent_version()),
-        ("Обращений к модели", f"{p.usage.calls} (повторов: {p.usage.retries}); токенов: вход {p.usage.input_tokens:,}, выход {p.usage.output_tokens:,}".replace(",", " ") if p else "0"),
+        ("Обращений к модели", (f"{p.usage.calls} (повторов: {p.usage.retries}); токенов: вход {p.usage.input_tokens:,}, "
+                                f"выход {p.usage.output_tokens:,}".replace(",", " ")
+                                + (f"; стоимость ${p.usage.cost_usd:.4f}" if p.usage.cost_usd else "")) if p else "0"),
         ("Стандарты", "ISO/IEC/IEEE 29148:2018 п. 5.2.5, 5.2.6, 5.2.7; IEEE Std 830-1998 п. 4.3"),
     ]
     L += [f"| {k} | {_cell(val)} |" for k, val in rows] + [""]
 
     # 2. Методика ------------------------------------------------------------
-    L += ["## 2. Методика", "",
-          "Агент выполняет статическое ревью: (1) извлекает текст с номерами строк; (2) LLM выделяет требования, "
-          "каждая цитата сверяется с исходным текстом; (3) формальные правила ищут заглушки, пустые поля, размытые "
-          "термины, требования без идентификаторов; (4) LLM проверяет каждое требование по критериям C1–C9 и "
-          "(5) набор целиком по S1–S8; (6) каждая цитата дефекта сверяется с документом — дефекты без подтверждённой "
-          "цитаты в отчёт не попадают; (7) итог формируется по правилу: есть критичные → «НЕ ГОТОВ», есть значительные → "
-          "«ГОТОВ С ОГОВОРКАМИ», иначе «ГОТОВ».", "",
+    if p:
+        rej = len(res.rejected)
+        method = ("Агент выполняет статическое ревью: (1) извлекает текст с номерами строк; (2) выделяет требования "
+                  f"({'моделью' if res.extraction == 'LLM' else 'формальными правилами — ' + res.extraction}), "
+                  "каждая цитата сверяется с исходным текстом; (3) формальные правила ищут заглушки, пустые поля, "
+                  "размытые термины, требования без идентификаторов; (4) модель проверяет каждое требование по "
+                  "критериям C1–C9 и (5) набор целиком по S1–S8; (6) цитата каждого дефекта ищется в документе — "
+                  "дефект без подтверждённой цитаты в отчёт не попадает"
+                  + (f" (отброшено замечаний: {rej}, перечислены в приложении)" if rej else "")
+                  + "; (7) итог: есть критичные → «НЕ ГОТОВ»; часть проверки не выполнена → «ПРОВЕРКА НЕ ЗАВЕРШЕНА»; "
+                  "есть значительные → «ГОТОВ С ОГОВОРКАМИ»; иначе «ГОТОВ».")
+    else:
+        method = ("Режим offline: модель не использовалась. Выполнены только формальные правила (заглушки, пустые поля, "
+                  "незаполненный чек-лист, размытые термины, временные характеристики без условий измерения, "
+                  "требования без идентификаторов). Проверка по смыслу критериев C1–C9 и S1–S8 не проводилась: "
+                  "✔ в матрице означает только отсутствие формальных находок.")
+    L += ["## 2. Методика", "", method, "",
           "| Код | Свойство | Источник |", "| :--- | :--- | :--- |"]
     L += [f"| {c} | {n} | {s} |" for c, (n, s, _) in {**REQ_CRITERIA, **SET_CRITERIA}.items()]
     L += ["", "Шкала критичности:", SEVERITY_RULES, "",
@@ -117,10 +132,13 @@ def build_markdown(res: RunResult) -> str:
     for r in reqs:
         L += [f"#### {r.rid} · {_cell(r.doc_id)} — {_cell(r.summary)}", "",
               f"> {_cell(r.quote, 1200)}", "", f"Место: {r.location.human()}", ""]
-        if r.rid in res.unchecked:
-            L += ["⚠ Модель не вернула оценку этого требования — требуется ручная проверка.", ""]
-            continue
         items = sorted(req_f[r.rid], key=lambda f: SEVERITY_ORDER.get(f.severity, 3))
+        if r.rid in res.unchecked:
+            L += ["⚠ Модель не вернула оценку этого требования — требуется ручная проверка"
+                  + (". Ниже — только формальные находки." if items else "."), ""]
+            for f in items:
+                L += _finding_block(f)
+            continue
         if not items:
             L += ["✔ Нарушений критериев C1–C9 не выявлено.", ""]
             continue
@@ -181,12 +199,24 @@ def build_markdown(res: RunResult) -> str:
     L.append("")
 
     # Приложение ----------------------------------------------------------
-    if res.notes or res.unchecked:
+    if res.notes or res.unchecked or res.rejected or res.failed_steps:
         L += ["## Приложение. Журнал прогона", ""]
+        if res.failed_steps:
+            L.append(f"- Шаги, на которых модель не ответила: {', '.join(res.failed_steps)}")
         if res.unchecked:
             L.append(f"- Не получена оценка модели: {', '.join(res.unchecked)}")
         L += [f"- {n}" for n in res.notes]
         L.append("")
+        if res.rejected:
+            L += ["### Отброшенные замечания модели", "",
+                  "Цитата, на которую ссылалась модель, не найдена в документе (ни дословно, ни нечётко), поэтому "
+                  "замечание не включено в отчёт: это защита от выдуманных дефектов. Список приведён для прозрачности.", "",
+                  "| Область | Требование | Критерий | Замечание | Цитата модели (не найдена) |",
+                  "| :--- | :--- | :--- | :--- | :--- |"]
+            for j in res.rejected:
+                L.append(f"| {'требование' if j.scope == 'requirement' else 'набор'} | {_cell(j.req_id)} | "
+                         f"{_crit_name(j.criterion)} | {_cell(j.title)} | «{_cell(j.quote, 200)}» |")
+            L.append("")
     L += ["---", f"*Отчёт сформирован автоматически агентом reqval {agent_version()}.*", ""]
     return "\n".join(L)
 
@@ -208,7 +238,8 @@ def build_json(res: RunResult) -> dict:
                      for f in res.findings],
         "verdict": {"status": res.verdict.status, "development": res.verdict.development, "testing": res.verdict.testing,
                     "priorities": [{"findings": ids, "action": a} for ids, a in res.verdict.priorities]},
-        "notes": res.notes, "unchecked": res.unchecked,
+        "notes": res.notes, "unchecked": res.unchecked, "complete": res.complete, "failed_steps": res.failed_steps,
+        "extraction": res.extraction, "rejected": [asdict(j) for j in res.rejected],
     }
 
 

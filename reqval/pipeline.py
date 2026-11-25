@@ -9,7 +9,7 @@ from typing import Optional
 
 from . import prompts, rules
 from .anchor import Anchorer
-from .criteria import CRITICAL_CRITERIA, SEVERITY_ORDER
+from .criteria import CRITICAL_CRITERIA, SEVERITY_ORDER, normalize_rid
 from .llm import BaseProvider, LLMError
 from .models import (Document, Finding, LLMExtraction, LLMReqBatch, LLMSetResult, LLMVerdict,
                      Location, Requirement)
@@ -17,9 +17,25 @@ from .models import (Document, Finding, LLMExtraction, LLMReqBatch, LLMSetResult
 log = logging.getLogger("reqval")
 
 
+NOT_READY = "НЕ ГОТОВ"
+READY_WITH_REMARKS = "ГОТОВ С ОГОВОРКАМИ"
+READY = "ГОТОВ"
+INCOMPLETE = "ПРОВЕРКА НЕ ЗАВЕРШЕНА"
+
+
+@dataclass
+class Rejected:
+    """Замечание модели, отброшенное потому, что его цитаты нет в документе (возможная галлюцинация)."""
+    scope: str          # requirement / set
+    req_id: str         # R-xx или «—»
+    criterion: str
+    title: str
+    quote: str          # цитата модели, которую не нашли в тексте
+
+
 @dataclass
 class Verdict:
-    status: str                    # НЕ ГОТОВ / ГОТОВ С ОГОВОРКАМИ / ГОТОВ
+    status: str                    # НЕ ГОТОВ / ГОТОВ С ОГОВОРКАМИ / ГОТОВ / ПРОВЕРКА НЕ ЗАВЕРШЕНА
     development: str
     testing: str
     priorities: list[tuple[list[str], str]]
@@ -37,6 +53,14 @@ class RunResult:
     mode: str
     notes: list[str] = field(default_factory=list)     # заметки о прогоне (отброшенные цитаты и т.п.)
     unchecked: list[str] = field(default_factory=list)  # требования, которые LLM не оценила
+    rejected: list[Rejected] = field(default_factory=list)  # отброшенные замечания модели
+    failed_steps: list[str] = field(default_factory=list)   # шаги, на которых LLM не ответила
+    extraction: str = "LLM"                                  # LLM / правила / правила (ошибка LLM)
+
+    @property
+    def complete(self) -> bool:
+        """Все шаги проверки выполнены. Если нет — отчёт честно помечается как неполный."""
+        return not self.unchecked and not self.failed_steps
 
 
 def _fmt_req(r: Requirement, maxlen: int = 400) -> str:
@@ -55,11 +79,32 @@ class Pipeline:
         self.batch_size = batch_size
         self.anchor = Anchorer(doc)
         self.notes: list[str] = []
+        self.rejected: list[Rejected] = []
+        self.failed_steps: list[str] = []
+        self.extraction = "правила" if provider is None else "LLM"
 
     # ------------------------------------------------------------------ extraction
     def extract(self) -> list[Requirement]:
         if self.llm is None:
             return self._extract_offline()
+        try:
+            reqs = self._extract_llm()
+        except LLMError as e:
+            self.failed_steps.append("нарезка")
+            self.notes.append(f"Нарезка: ошибка LLM — {e}. Требования выделены формальными правилами.")
+            log.warning("Нарезка моделью не удалась (%s) — нарезаю правилами", str(e)[:160])
+            self.extraction = "правила (ошибка LLM)"
+            return self._extract_offline()
+        if not reqs:
+            self.failed_steps.append("нарезка")
+            self.notes.append("Нарезка: модель не вернула ни одного требования с подтверждённой цитатой. "
+                              "Требования выделены формальными правилами.")
+            log.warning("Модель не выделила требований — нарезаю правилами")
+            self.extraction = "правила (модель не выделила требований)"
+            return self._extract_offline()
+        return reqs
+
+    def _extract_llm(self) -> list[Requirement]:
         text = self.doc.numbered_text()
         res = self.llm.generate(prompts.EXTRACT_SYSTEM,
                                 prompts.EXTRACT_USER.format(name=self.doc.name, text=text),
@@ -105,9 +150,12 @@ class Pipeline:
         skip_sections = re.compile(r"(общие сведения|общие параметры|ревью|согласующ|содержание)", re.I)
         reqs: list[Requirement] = []
         header_seen: set[str] = set()
+        has_sections = any(l.is_heading and l.section for l in self.doc.lines)
         for ln in self.doc.lines:
             t = ln.text.strip()
             if not t or ln.is_heading or skip_sections.search(ln.section):
+                continue
+            if has_sections and not ln.section:   # преамбула до первого раздела — служебный текст
                 continue
             if "|" in t and ln.section not in header_seen:   # первая строка таблицы — заголовок
                 header_seen.add(ln.section)
@@ -130,6 +178,18 @@ class Pipeline:
             if _overlap(r.location, loc):
                 return r
         return None
+
+    @staticmethod
+    def _resolve_req(raw: str, by_id: dict[str, Requirement], candidates: list[Requirement]) -> Optional[Requirement]:
+        """ID требования из ответа модели → требование. Модель пишет «R-1», «R01», «Р-01» (кириллица)
+        или вместо нашего ID даёт номер из документа («Ф-2») — всё это сводится к одному требованию."""
+        rid = normalize_rid(raw)
+        req = by_id.get(rid) if rid else None
+        if req is None:
+            key = re.sub(r"\W+", "", str(raw)).lower()
+            same = [r for r in candidates if key and re.sub(r"\W+", "", r.doc_id).lower() == key]
+            req = same[0] if len(same) == 1 else None
+        return req
 
     def _anchor_issue_quote(self, quote: str, req: Optional[Requirement]) -> tuple[str, Optional[Location]]:
         hint = req.location.line_from if req else None
@@ -165,16 +225,20 @@ class Pipeline:
                     break
                 got = set()
                 for a in res.assessments:
-                    req = by_id.get(a.req_id.strip())
-                    if req is None or req not in pending:
+                    req = self._resolve_req(a.req_id, by_id, pending)
+                    if req is None:
+                        self.notes.append(f"{label}: модель вернула оценку для неизвестного требования «{a.req_id}» — пропущена.")
+                        continue
+                    if req not in pending:      # уже оценено или не из этого пакета
                         continue
                     got.add(req.rid)
                     for iss in a.issues:
                         quote, loc = self._anchor_issue_quote(iss.quote, req)
                         if loc is None:
-                            quote, loc = req.quote, req.location
-                            self.notes.append(f"{req.rid}: цитата модели «{iss.quote[:60]}» не найдена дословно — дефект привязан к месту требования.")
-                        findings.append(Finding("", "requirement", iss.criterion.strip().upper()[:3], iss.severity,
+                            self.rejected.append(Rejected("requirement", req.rid, iss.criterion, iss.title.strip(),
+                                                          iss.quote.strip()))
+                            continue
+                        findings.append(Finding("", "requirement", iss.criterion, iss.severity,
                                                 iss.title.strip(), iss.explanation.strip(), iss.recommendation.strip(),
                                                 [req.rid], [(quote, loc)]))
                 pending = [r for r in pending if r.rid not in got]
@@ -196,12 +260,13 @@ class Pipeline:
                                         all_reqs=all_reqs, rule_hits=rh), LLMSetResult, label=label)
             except LLMError as e:
                 self.notes.append(f"{label}: ошибка LLM — {e}")
+                self.failed_steps.append(label)
                 continue
             for iss in res.issues:
                 ev: list[tuple[str, Location]] = []
                 rids: list[str] = []
                 for e in iss.evidence:
-                    req = by_id.get(e.req_id.strip())
+                    req = self._resolve_req(e.req_id, by_id, reqs)
                     quote, loc = self._anchor_issue_quote(e.quote, req)
                     if loc is None:
                         self.notes.append(f"Набор: цитата «{e.quote[:60]}» к дефекту «{iss.title}» не найдена — исключена.")
@@ -211,29 +276,37 @@ class Pipeline:
                     if owner and owner.rid not in rids:
                         rids.append(owner.rid)
                 if not ev:
-                    self.notes.append(f"Набор: дефект «{iss.title}» отброшен — ни одна цитата не подтверждена текстом.")
+                    self.rejected.append(Rejected("set", ", ".join(e.req_id for e in iss.evidence) or "—", iss.criterion,
+                                                  iss.title.strip(), " … ".join(e.quote.strip() for e in iss.evidence)))
                     continue
-                findings.append(Finding("", "set", iss.criterion.strip().upper()[:3], iss.severity, iss.title.strip(),
+                findings.append(Finding("", "set", iss.criterion, iss.severity, iss.title.strip(),
                                         iss.explanation.strip(), iss.recommendation.strip(), rids, ev))
         return findings
 
     # ------------------------------------------------------------------ verdict
     @staticmethod
-    def auto_status(findings: list[Finding]) -> str:
+    def auto_status(findings: list[Finding], complete: bool = True) -> str:
+        """Критичные дефекты → НЕ ГОТОВ в любом случае. Если часть проверки не выполнена (модель не ответила),
+        «ГОТОВ» выдавать нельзя: отсутствие найденных дефектов ничего не доказывает."""
         if any(f.severity == "критичный" for f in findings):
-            return "НЕ ГОТОВ"
+            return NOT_READY
+        if not complete:
+            return INCOMPLETE
         if any(f.severity == "значительный" for f in findings):
-            return "ГОТОВ С ОГОВОРКАМИ"
-        return "ГОТОВ"
+            return READY_WITH_REMARKS
+        return READY
 
-    def verdict(self, reqs: list[Requirement], findings: list[Finding]) -> Verdict:
-        status = self.auto_status(findings)
+    def verdict(self, reqs: list[Requirement], findings: list[Finding], unchecked: list[str] | None = None) -> Verdict:
+        complete = not unchecked and not self.failed_steps
+        status = self.auto_status(findings, complete)
         crit = [f for f in findings if f.severity == "критичный"]
         cnt = {s: sum(1 for f in findings if f.severity == s) for s in SEVERITY_ORDER}
+        gaps = ", ".join(self.failed_steps + ([f"оценка {len(unchecked)} требований"] if unchecked else []))
         fallback_dev = {
-            "НЕ ГОТОВ": f"Начинать разработку нельзя: {len(crit)} критичных дефектов ({', '.join(f.fid for f in crit[:10])}) допускают разное толкование поведения системы.",
-            "ГОТОВ С ОГОВОРКАМИ": "Разработку можно начинать после согласования значительных дефектов с аналитиком.",
-            "ГОТОВ": "Критичных и значительных дефектов не найдено — разработку можно начинать.",
+            NOT_READY: f"Начинать разработку нельзя: {len(crit)} критичных дефектов ({', '.join(f.fid for f in crit[:10])}) допускают разное толкование поведения системы.",
+            READY_WITH_REMARKS: "Разработку можно начинать после согласования значительных дефектов с аналитиком.",
+            READY: "Критичных и значительных дефектов не найдено — разработку можно начинать.",
+            INCOMPLETE: f"Вывод о готовности сделать нельзя: часть проверки не выполнена ({gaps}). Повторите прогон.",
         }[status]
         fallback_test = ("Проектирование тест-кейсов заблокировано для требований с критичными дефектами."
                          if crit else "Тестирование можно планировать по текущей версии.")
@@ -278,9 +351,10 @@ class Pipeline:
             fr, unchecked = self.check_requirements(reqs, req_hits)
             fs = self.check_set(reqs, doc_hits)
             findings += fr + fs
-        else:
-            for rid, hs in req_hits.items():
-                for h in hs:
+        rule_only = set(req_hits) if self.llm is None else set(unchecked) & set(req_hits)
+        if rule_only:   # модель эти требования не оценила — оставляем хотя бы формальные находки
+            for rid in [r.rid for r in reqs if r.rid in rule_only]:
+                for h in req_hits[rid]:
                     findings.append(Finding("", "requirement", h.criterion, h.severity, h.title, h.explanation,
                                             h.recommendation, [rid], [(h.quote, h.location)], source="правило"))
 
@@ -305,10 +379,14 @@ class Pipeline:
         for i, f in enumerate(findings, 1):
             f.fid = f"D-{i:03d}"
 
-        verdict = self.verdict(reqs, findings)
+        verdict = self.verdict(reqs, findings, unchecked)
+        if self.rejected:
+            log.warning("Отброшено замечаний модели без подтверждённой цитаты: %d (см. приложение отчёта)",
+                        len(self.rejected))
         finished = datetime.now().astimezone()
         return RunResult(self.doc, reqs, findings, verdict, started, finished, self.llm,
-                         "LLM" if self.llm else "offline (только правила)", self.notes, unchecked)
+                         "LLM" if self.llm else "offline (только правила)", self.notes, unchecked,
+                         self.rejected, self.failed_steps, self.extraction)
 
 
 def is_critical_type(f: Finding) -> Optional[str]:
