@@ -151,3 +151,41 @@ def test_unchecked_requirement_shows_dash(doc):
     assert "✔" not in cells, "непроверенное требование не может выглядеть как «нарушений нет»"
     assert cells.count("✖") == 1 and cells[6] == "✖", "формальная находка C7 («в течение минуты») видна"
     assert set(cells) == {"—", "✖"}
+
+
+# --------------------------------------------------------------------------- 7б: регрессия на реальном прогоне
+
+import json  # noqa: E402
+
+from reqval.dedup import dedupe  # noqa: E402
+from reqval.models import Finding, Location  # noqa: E402
+
+RUN = ROOT / "tests" / "data" / "run_findings.json"
+
+
+def _load_run():
+    d = json.loads(RUN.read_text(encoding="utf-8"))
+    return [Finding(x["id"], x["scope"], x["criterion"], x["severity"], x["title"], x["explanation"],
+                    x["recommendation"], list(x["requirements"]),
+                    [(e["quote"], Location(**e["location"])) for e in x["evidence"]], x["source"])
+            for x in d["findings"]]
+
+
+def test_real_run_api_contradictions_counted_once():
+    """Прогон Claude Sonnet 5.5: «200+ERROR или 400» шло трижды, «403 или 404» — дважды, с соседних строк API."""
+    out, merged, linked = dedupe(_load_run())
+    links = {f.fid: f.dup_of.fid for f in out if f.dup_of is not None}
+    assert links == {"D-042": "D-068", "D-049": "D-068", "D-056": "D-068", "D-059": "D-067"}
+    crit = sorted(f.fid for f in out if f.dup_of is None and f.severity == "критичный")
+    assert crit == ["D-025", "D-064", "D-065", "D-066", "D-067", "D-068"]
+    d068 = next(f for f in out if f.fid == "D-068")
+    assert {"R-35", "R-44", "R-50"} <= set(d068.req_ids), "дефект набора перечисляет все затронутые требования"
+
+
+def test_real_run_different_contradictions_stay_apart():
+    out, _, _ = dedupe(_load_run())
+    by = {f.fid: f for f in out}
+    for fid in ("D-064", "D-065", "D-066", "D-067", "D-068", "D-077"):    # разные противоречия набора
+        assert by[fid].dup_of is None
+    for fid in ("D-046", "D-047", "D-052", "D-013"):   # соседние, но другие дефекты (типы полей, тело 403 и т.п.)
+        assert by[fid].dup_of is None, fid

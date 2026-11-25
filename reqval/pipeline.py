@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 from . import prompts, rules
-from .anchor import Anchorer
+from .anchor import MIN_EVIDENCE_CHARS, Anchorer
 from .dedup import dedupe
 from .criteria import CRITICAL_CRITERIA, SEVERITY_ORDER, normalize_rid
 from .llm import BaseProvider, LLMError
@@ -198,8 +198,10 @@ class Pipeline:
         return req
 
     def _anchor_issue_quote(self, quote: str, req: Optional[Requirement]) -> tuple[str, Optional[Location]]:
+        """Цитата-доказательство: сначала в строках своего требования; короткая — только там."""
         hint = req.location.line_from if req else None
-        loc = self.anchor.locate(quote, hint_line=hint)
+        loc = self.anchor.locate(quote, hint_line=hint, within=req.location if req else None,
+                                 min_global=MIN_EVIDENCE_CHARS)
         if loc is not None:
             return quote, loc
         return quote, None
@@ -302,6 +304,17 @@ class Pipeline:
             return READY_WITH_REMARKS
         return READY
 
+    @staticmethod
+    def fallback_priorities(findings: list[Finding], limit: int = 8) -> list[tuple[list[str], str]]:
+        """«Что исправить в первую очередь» без модели: критичные, затем значительные; внутри уровня —
+        противоречия, непроверяемые и неполные формулировки (группы ТЗ) раньше остальных, затем по номеру."""
+        from .criteria import tz_group
+        group_rank = {"contradictory": 0, "unverifiable": 1, "incomplete": 2}
+        top = sorted((f for f in findings if f.severity in ("критичный", "значительный")),
+                     key=lambda f: (SEVERITY_ORDER.get(f.severity, 3), group_rank.get(tz_group(f.criterion), 3), f.fid))
+        return [([f.fid], f"{f.title}. {f.recommendation}".strip() if f.recommendation else f.title)
+                for f in top[:limit]]
+
     def verdict(self, reqs: list[Requirement], findings: list[Finding], unchecked: list[str] | None = None) -> Verdict:
         complete = not unchecked and not self.failed_steps
         status = self.auto_status(findings, complete)
@@ -316,7 +329,7 @@ class Pipeline:
         }[status]
         fallback_test = ("Проектирование тест-кейсов заблокировано для требований с критичными дефектами."
                          if crit else "Тестирование можно планировать по текущей версии.")
-        fallback_prio = [([f.fid], f.title) for f in crit[:8]]
+        fallback_prio = self.fallback_priorities(findings)
         if self.llm is None:
             return Verdict(status, fallback_dev, fallback_test, fallback_prio)
         ids = {f.fid for f in findings}

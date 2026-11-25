@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
-from .criteria import ALL_CRITERIA, REQ_CRITERIA, SET_CRITERIA, SEVERITY_ORDER, SEVERITY_RULES
+from .criteria import ALL_CRITERIA, REQ_CRITERIA, SET_CRITERIA, SEVERITY_ORDER, SEVERITY_RULES, TZ_GROUPS, tz_group
 from .models import Finding, Location
 from .pipeline import RunResult, _overlap, is_critical_type
 from .version import agent_version
@@ -55,6 +55,42 @@ def _finding_block(f: Finding, related: list[str] | None = None) -> list[str]:
     return out
 
 
+def _model_line(p) -> str:
+    primary = p.primary_model or p.model
+    line = f"{primary} ({p.name})"
+    fb = sorted({step for step, m in p.usage.steps.items() if m != primary})
+    if fb:
+        line += f"; запасная модель {p.fallback_model} отвечала на шагах: {', '.join(fb)}"
+    return line
+
+
+def _journal_line(p) -> str:
+    """Файл журнала, число записей и SHA-256: отчёт однозначно связан с конкретным журналом прогона."""
+    if not p.journal_path or not os.path.exists(p.journal_path):
+        return "—"
+    import hashlib
+    with open(p.journal_path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    line = f"{os.path.basename(p.journal_path)} — {p.usage.journal_records} записей, SHA-256 `{digest[:16]}…`"
+    if p.usage.cached:
+        line += f"; ⚠ ответов из кэша: {p.usage.cached}"
+    if p.usage.skipped:
+        line += f"; ⚠ пропущено предохранителем: {len(p.usage.skipped)}"
+    return line
+
+
+def tz_summary(findings: list[Finding]) -> dict[str, list[Finding]]:
+    """Дефекты (без повторов) по группам ТЗ, по убыванию критичности и в порядке номеров."""
+    groups: dict[str, list[Finding]] = {g: [] for g in TZ_GROUPS}
+    for f in findings:
+        g = tz_group(f.criterion)
+        if g:
+            groups[g].append(f)
+    for g in groups:
+        groups[g].sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 3), f.fid))
+    return groups
+
+
 def build_markdown(res: RunResult) -> str:
     doc, reqs, fs, v = res.doc, res.requirements, res.findings, res.verdict
     p = res.provider
@@ -81,12 +117,14 @@ def build_markdown(res: RunResult) -> str:
         ("SHA-256 файла", f"`{doc.sha256}`"),
         ("Дата и время прогона", f"{res.started:%d.%m.%Y %H:%M:%S %Z} (длительность {dur:.0f} с)"),
         ("Режим", res.mode + ("" if res.extraction in ("LLM", "правила") else f"; нарезка требований: {res.extraction}")),
-        ("Модель", f"{p.model} ({p.name})" if p else "— (LLM не использовалась)"),
-        ("Параметры модели", f"temperature={p.temperature}, seed=42, structured output (JSON-схема)" if p else "—"),
+        ("Модель", _model_line(p) if p else "— (LLM не использовалась)"),
+        ("Параметры модели", p.describe() if p else "—"),
         ("Версия агента", agent_version()),
-        ("Обращений к модели", (f"{p.usage.calls} (повторов: {p.usage.retries}); токенов: вход {p.usage.input_tokens:,}, "
-                                f"выход {p.usage.output_tokens:,}".replace(",", " ")
+        ("Обращений к модели", (f"{p.usage.calls} (повторов: {p.usage.retries}); токенов: вход "
+                                f"{p.usage.input_tokens:,}".replace(",", " ") + ", выход "
+                                + f"{p.usage.output_tokens:,}".replace(",", " ")
                                 + (f"; стоимость ${p.usage.cost_usd:.4f}" if p.usage.cost_usd else "")) if p else "0"),
+        ("Журнал обращений к модели", _journal_line(p) if p else "—"),
         ("Стандарты", "ISO/IEC/IEEE 29148:2018 п. 5.2.5, 5.2.6, 5.2.7; IEEE Std 830-1998 п. 4.3"),
     ]
     L += [f"| {k} | {_cell(val)} |" for k, val in rows] + [""]
@@ -201,19 +239,52 @@ def build_markdown(res: RunResult) -> str:
         L.append("Критичных дефектов не выявлено.")
     L.append("")
 
+    # Группы ТЗ: непроверяемые / противоречивые / неполные. Критичные и значительные — списком,
+    # незначительные — только числом, чтобы сводка оставалась читаемой.
+    groups = tz_summary(fs)
+    L += ["### Непроверяемые, противоречивые и неполные формулировки", "",
+          "| Группа | Критерии | Всего | 🔴 | 🟠 | 🟡 |", "| :--- | :--- | :-: | :-: | :-: | :-: |"]
+    for g, (title, codes) in TZ_GROUPS.items():
+        c = Counter(f.severity for f in groups[g])
+        L.append(f"| {title} | {', '.join(codes)} | {len(groups[g])} | {c['критичный']} | {c['значительный']} | "
+                 f"{c['незначительный']} |")
+    L.append("")
+    for g, (title, _) in TZ_GROUPS.items():
+        main = [f for f in groups[g] if f.severity != "незначительный"]
+        minor = len(groups[g]) - len(main)
+        L += [f"**{title}** — {len(groups[g])}" + (f" (незначительных: {minor}, перечислены в разделах 4–5)" if minor else ""), ""]
+        if not main:
+            L += ["Критичных и значительных нет." if groups[g] else "Не выявлено.", ""]
+            continue
+        for f in main:
+            L.append(f"- {SEV_ICON.get(f.severity, '')} **{f.fid}** ({', '.join(f.req_ids) or 'документ'}) — "
+                     f"{_cell(f.title)}; {_cell(f.evidence[0][1].human())}")
+        L.append("")
+
     # 7. Итог ---------------------------------------------------------------
     L += ["## 7. Итог", "", f"**Решение: {v.status}**", "",
           f"- **Разработка:** {v.development}", f"- **Тестирование:** {v.testing}", "",
           "### Что исправить в первую очередь", ""]
     for i, (ids, action) in enumerate(v.priorities, 1):
         L.append(f"{i}. {action}" + (f" ({', '.join(ids)})" if ids else ""))
+    if not v.priorities:
+        if not res.complete:
+            L.append("Сначала повторите прогон: часть проверки не выполнена, список приоритетов был бы неполным.")
+        elif fs:
+            L.append("Критичных и значительных дефектов нет; незначительные замечания — в разделах 4–5.")
+        else:
+            L.append("Исправлять нечего: дефектов не выявлено.")
     L.append("")
 
     # Приложение ----------------------------------------------------------
-    if res.notes or res.unchecked or res.rejected or res.failed_steps:
+    skipped = res.provider.usage.skipped if res.provider else []
+    if res.notes or res.unchecked or res.rejected or res.failed_steps or skipped:
         L += ["## Приложение. Журнал прогона", ""]
         if res.failed_steps:
             L.append(f"- Шаги, на которых модель не ответила: {', '.join(res.failed_steps)}")
+        if skipped:
+            L.append(f"- Шаги, пропущенные предохранителем (модель недоступна несколько шагов подряд): "
+                     f"{', '.join(skipped)}. Причина: {res.provider.tripped}")
         if res.unchecked:
             L.append(f"- Не получена оценка модели: {', '.join(res.unchecked)}")
         L += [f"- {n}" for n in res.notes]
@@ -239,7 +310,9 @@ def build_json(res: RunResult) -> dict:
     return {
         "document": {"name": res.doc.name, "file": os.path.basename(res.doc.path), "format": res.doc.fmt, "sha256": res.doc.sha256},
         "run": {"started": res.started.isoformat(), "finished": res.finished.isoformat(), "mode": res.mode,
-                "model": res.provider.model if res.provider else None, "agent_version": agent_version(),
+                "model": (res.provider.primary_model or res.provider.model) if res.provider else None,
+                "agent_version": agent_version(),
+                "journal": os.path.basename(res.provider.journal_path) if res.provider and res.provider.journal_path else None,
                 "usage": asdict(res.provider.usage) if res.provider else None},
         "requirements": [{"id": r.rid, "doc_id": r.doc_id, "kind": r.kind, "summary": r.summary, "quote": r.quote,
                           "location": loc(r.location), "anchored": r.anchored} for r in res.requirements],
@@ -247,6 +320,12 @@ def build_json(res: RunResult) -> dict:
                       "explanation": f.explanation, "recommendation": f.recommendation, "requirements": f.req_ids,
                       "evidence": [{"quote": q, "location": loc(l)} for q, l in f.evidence], "source": f.source}
                      for f in res.findings],
+        "summary": {
+            "requirements": len(res.requirements), "findings": len(res.unique_findings),
+            "by_severity": dict(Counter(f.severity for f in res.unique_findings)),
+            "tz_groups": {g: {"title": TZ_GROUPS[g][0], "findings": [f.fid for f in lst]}
+                          for g, lst in tz_summary(res.unique_findings).items()},
+        },
         "verdict": {"status": res.verdict.status, "development": res.verdict.development, "testing": res.verdict.testing,
                     "priorities": [{"findings": ids, "action": a} for ids, a in res.verdict.priorities]},
         "notes": res.notes, "unchecked": res.unchecked, "complete": res.complete, "failed_steps": res.failed_steps,

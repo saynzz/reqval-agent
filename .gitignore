@@ -53,3 +53,6 @@ Thumbs.db
 # Отчёты прогонов
 out/
 .pytest_cache/
+
+# Кэш ответов модели (--cache)
+.reqval_cache/

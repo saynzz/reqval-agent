@@ -1,10 +1,11 @@
 """Модели данных агента: документ, требования, дефекты."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .criteria import normalize_code
 
@@ -70,6 +71,14 @@ class Location:
 
 Severity = Literal["критичный", "значительный", "незначительный"]
 
+
+def title_from(explanation: str, limit: int = 80) -> str:
+    """Короткое название дефекта из первого предложения объяснения — если модель его не дала.
+    Без строгой схемы (например, Claude через OpenRouter) модели часто опускают «второстепенное» поле title,
+    и отбрасывать из-за этого весь содержательный ответ нельзя."""
+    first = re.split(r"(?<=[.!?:;])\s|\s[—–]\s", explanation.strip(), maxsplit=1)[0].rstrip(".:;")
+    return first if len(first) <= limit else first[:limit].rsplit(" ", 1)[0] + "…"
+
 # Коды критериев — закрытый список (enum в JSON-схеме). Код вне справочника выпадал бы из матрицы
 # соответствия, и отчёт противоречил бы сам себе.
 ReqCriterion = Literal["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
@@ -123,12 +132,18 @@ class LLMExtraction(BaseModel):
 class LLMIssue(BaseModel):
     criterion: ReqCriterion = Field(description="Код критерия отдельного требования C1–C9")
     severity: Literal["критичный", "значительный", "незначительный"]
-    title: str = Field(description="Короткое название дефекта")
+    title: str = Field(default="", description="Короткое название дефекта")
     quote: str = Field(description="ДОСЛОВНЫЙ фрагмент документа, к которому относится дефект")
     explanation: str = Field(description="В чём дефект и почему это нарушение критерия")
     recommendation: str = Field(description="Как переформулировать/исправить")
 
     _norm_criterion = field_validator("criterion", mode="before")(normalize_code)
+
+    @model_validator(mode="after")
+    def _fill_title(self):
+        if not self.title.strip():
+            self.title = title_from(self.explanation) or "Дефект"
+        return self
 
 
 class LLMReqAssessment(BaseModel):
@@ -148,12 +163,18 @@ class LLMEvidence(BaseModel):
 class LLMSetIssue(BaseModel):
     criterion: SetCriterion = Field(description="Код критерия набора S1–S8")
     severity: Literal["критичный", "значительный", "незначительный"]
-    title: str
+    title: str = Field(default="", description="Короткое название дефекта")
     explanation: str
     recommendation: str
     evidence: list[LLMEvidence]
 
     _norm_criterion = field_validator("criterion", mode="before")(normalize_code)
+
+    @model_validator(mode="after")
+    def _fill_title(self):
+        if not self.title.strip():
+            self.title = title_from(self.explanation) or "Дефект набора"
+        return self
 
 
 class LLMSetResult(BaseModel):
