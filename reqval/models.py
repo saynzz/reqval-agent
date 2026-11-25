@@ -132,7 +132,8 @@ class LLMExtraction(BaseModel):
 class LLMIssue(BaseModel):
     criterion: ReqCriterion = Field(description="Код критерия отдельного требования C1–C9")
     severity: Literal["критичный", "значительный", "незначительный"]
-    title: str = Field(default="", description="Короткое название дефекта")
+    title: str = Field(default="", description="Конкретное название дефекта: что и с чем не так, с номерами "
+                       "(например «Ф-2 противоречит критерию приёмки №2 о границе месяца»), не общие слова")
     quote: str = Field(description="ДОСЛОВНЫЙ фрагмент документа, к которому относится дефект")
     explanation: str = Field(description="В чём дефект и почему это нарушение критерия")
     recommendation: str = Field(description="Как переформулировать/исправить")
@@ -163,7 +164,7 @@ class LLMEvidence(BaseModel):
 class LLMSetIssue(BaseModel):
     criterion: SetCriterion = Field(description="Код критерия набора S1–S8")
     severity: Literal["критичный", "значительный", "незначительный"]
-    title: str = Field(default="", description="Короткое название дефекта")
+    title: str = Field(default="", description="Конкретное название дефекта: что и с чем не так, с номерами требований, не общие слова")
     explanation: str
     recommendation: str
     evidence: list[LLMEvidence]

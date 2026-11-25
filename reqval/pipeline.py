@@ -19,6 +19,11 @@ from .models import (Document, Finding, LLMExtraction, LLMReqBatch, LLMSetResult
 log = logging.getLogger("reqval")
 
 
+COVERAGE_KIND = "добавлено агентом (пропущено моделью)"
+# Ключи служебных строк карточек «поле | значение»: это сведения о документе, а не требования к системе.
+META_KEYS = re.compile(r"^(author|developer|gitlab|framework|swagger|jira|автор|разработчик|аналитик|"
+                       r"business owner|product owner|наименование|продукт|задача в jira|тип работы)", re.I)
+
 NOT_READY = "НЕ ГОТОВ"
 READY_WITH_REMARKS = "ГОТОВ С ОГОВОРКАМИ"
 READY = "ГОТОВ"
@@ -90,10 +95,11 @@ def _overlap(a: Location, b: Location) -> bool:
 
 
 class Pipeline:
-    def __init__(self, doc: Document, provider: Optional[BaseProvider], batch_size: int = 6):
+    def __init__(self, doc: Document, provider: Optional[BaseProvider], batch_size: int = 6, coverage: bool = True):
         self.doc = doc
         self.llm = provider
         self.batch_size = batch_size
+        self.coverage = coverage      # добирать строки, пропущенные моделью при нарезке
         self.anchor = Anchorer(doc)
         self.notes: list[str] = []
         self.rejected: list[Rejected] = []
@@ -112,6 +118,8 @@ class Pipeline:
             log.warning("Нарезка моделью не удалась (%s) — нарезаю правилами", str(e)[:160])
             self.extraction = "правила (ошибка LLM)"
             return self._extract_offline()
+        if reqs and self.coverage:
+            reqs = self._ensure_coverage(reqs)
         if not reqs:
             self.failed_steps.append("нарезка")
             self.notes.append("Нарезка: модель не вернула ни одного требования с подтверждённой цитатой. "
@@ -120,6 +128,37 @@ class Pipeline:
             self.extraction = "правила (модель не выделила требований)"
             return self._extract_offline()
         return reqs
+
+    def _ensure_coverage(self, reqs: list[Requirement]) -> list[Requirement]:
+        """Проверка покрытия нарезки. Слабые модели пропускают целые разделы (тело запроса, таблицу полей ответа),
+        а то, что не попало в нарезку, дальше никто не проверяет. Каждая содержательная строка, не вошедшая
+        ни в одно требование модели, добавляется как требование с пометкой — это видно в таблице нарезки."""
+        deep = any(l.section.count(" › ") >= 1 for l in self.doc.lines)
+
+        def worth(c: Requirement) -> bool:
+            if rules.PLACEHOLDER_RE.search(c.quote):        # заглушки ловят формальные правила
+                return False
+            key = c.quote.split("|", 1)[0].strip() if "|" in c.quote else ""
+            if key and META_KEYS.search(key):               # служебные поля карточки: автор, gitlab, swagger…
+                return False
+            if deep and " › " not in c.location.section:    # вводный текст сразу под заголовком части документа
+                return False
+            return True
+
+        missed = [c for c in self._extract_offline()
+                  if worth(c) and not any(_overlap(c.location, r.location) for r in reqs)]
+        if not missed:
+            return reqs
+        for c in missed:
+            c.kind = COVERAGE_KIND
+            c.anchored = True
+        out = sorted(reqs + missed, key=lambda r: (r.location.line_from, r.location.line_to))
+        for i, r in enumerate(out, 1):
+            r.rid = f"R-{i:02d}"
+        self.notes.append(f"Нарезка: модель пропустила {len(missed)} строк(и) с требованиями — агент добавил их сам "
+                          f"({', '.join(r.rid for r in out if r.kind == COVERAGE_KIND)}), тип «{COVERAGE_KIND}».")
+        log.info("Проверка покрытия: добавлено требований, пропущенных моделью: %d", len(missed))
+        return out
 
     def _extract_llm(self) -> list[Requirement]:
         text = self.doc.numbered_text()
@@ -164,7 +203,8 @@ class Pipeline:
 
     def _extract_offline(self) -> list[Requirement]:
         """Нарезка правилами (без LLM): пункты списков, абзацы, строки таблиц требований."""
-        skip_sections = re.compile(r"(общие сведения|общие параметры|ревью|согласующ|содержание)", re.I)
+        # «Общие параметры» метода API (тип запроса, URL, авторизация) — требования, а не метаданные документа.
+        skip_sections = re.compile(r"(общие сведения|ревью|согласующ|содержание)", re.I)
         reqs: list[Requirement] = []
         header_seen: set[str] = set()
         has_sections = any(l.is_heading and l.section for l in self.doc.lines)

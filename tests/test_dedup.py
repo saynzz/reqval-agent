@@ -101,7 +101,7 @@ class Model(BaseProvider):
 @pytest.fixture(scope="module")
 def run(doc):
     m = Model(doc)
-    return m, Pipeline(doc, m, batch_size=10).run()
+    return m, Pipeline(doc, m, batch_size=10, coverage=False).run()
 
 
 def test_set_check_is_one_request(run):
@@ -144,7 +144,7 @@ def test_numbering_and_report(run):
 
 
 def test_unchecked_requirement_shows_dash(doc):
-    res = Pipeline(doc, Model(doc, skip_nfr=True), batch_size=10).run()
+    res = Pipeline(doc, Model(doc, skip_nfr=True), batch_size=10, coverage=False).run()
     assert res.unchecked == ["R-02"]
     row = next(l for l in build_markdown(res).splitlines() if l.startswith("| R-02 ("))
     cells = [c.strip() for c in row.strip("|").split("|")][1:-1]

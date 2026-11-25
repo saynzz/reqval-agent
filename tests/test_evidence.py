@@ -95,7 +95,7 @@ class Model(BaseProvider):
 
 
 def test_pipeline_applies_rule(doc):
-    res = Pipeline(doc, Model(doc)).run()
+    res = Pipeline(doc, Model(doc), coverage=False).run()
     titles = {f.title: f for f in res.findings}
     assert titles["Нет валюты"].evidence[0][1].line_from == line(doc, "Ф-1")
     assert titles["Неясно, какой push"].evidence[0][1].line_from == line(doc, "Ф-3")
