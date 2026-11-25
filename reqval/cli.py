@@ -1,0 +1,60 @@
+"""Точка входа: python -m reqval <файл требований> <файл отчёта>."""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from dotenv import load_dotenv
+
+from .llm import LLMError, make_provider
+from .loader import load_document
+from .pipeline import Pipeline
+from .report import write_report
+from .version import version_info
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
+    ap = argparse.ArgumentParser(prog="reqval", description="AI-агент статической проверки требований "
+                                 "(ISO/IEC/IEEE 29148:2018, IEEE 830-1998)")
+    ap.add_argument("input", help="Путь к документу требований (.pdf, .docx, .md, .txt)")
+    ap.add_argument("output", help="Путь к файлу отчёта (.md или .html); рядом пишется .json")
+    ap.add_argument("--provider", default=None, help="gemini (по умолчанию) | openai | offline")
+    ap.add_argument("--model", default=None, help="Модель (по умолчанию GEMINI_MODEL из .env, иначе gemini-2.5-flash)")
+    ap.add_argument("--batch-size", type=int, default=6, help="Требований в одном запросе проверки (по умолчанию 6)")
+    ap.add_argument("--no-json", action="store_true", help="Не сохранять JSON-копию отчёта")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    for noisy in ("httpx", "google_genai", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    log = logging.getLogger("reqval")
+
+    vi = version_info()
+    log.info("Версия агента: %s", vi.label)
+    if vi.warning:
+        log.warning("Паспорт прогона: %s", vi.warning)
+
+    try:
+        doc = load_document(a.input)
+        provider = make_provider(a.provider, a.model)
+        if provider:
+            log.info("Модель: %s (%s)", provider.model, provider.name)
+        else:
+            log.warning("Режим offline: только формальные правила, без LLM")
+        res = Pipeline(doc, provider, batch_size=a.batch_size).run()
+        paths = write_report(res, a.output, with_json=not a.no_json)
+    except (LLMError, FileNotFoundError, ValueError) as e:
+        log.error("%s", e)
+        return 2
+    log.info("Готово: требований %d, дефектов %d, итог: %s", len(res.requirements), len(res.findings), res.verdict.status)
+    for p in paths:
+        log.info("Отчёт: %s", p)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
