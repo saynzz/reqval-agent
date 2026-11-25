@@ -99,6 +99,7 @@ class Finding:
     req_ids: list[str]
     evidence: list[tuple[str, Location]]   # (цитата, место) — подтверждённые в документе
     source: str = "LLM"     # LLM / правило
+    dup_of: Optional["Finding"] = None   # повторяет дефект набора: в сводке считается один раз (см. dedup.py)
 
 
 # ---------------------------------------------------------------------------

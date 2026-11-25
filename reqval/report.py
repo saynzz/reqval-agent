@@ -32,6 +32,11 @@ def _ev_lines(f: Finding) -> list[str]:
 
 
 def _finding_block(f: Finding, related: list[str] | None = None) -> list[str]:
+    if f.dup_of is not None:
+        q, loc = f.evidence[0]
+        return [f"**{_crit_name(f.criterion)}** · {SEV_ICON.get(f.severity, '')} {f.severity} — **{_cell(f.title)}** "
+                f"↪ тот же дефект описан в проверке набора: **{f.dup_of.fid}** (в сводке учтён один раз)", "",
+                f"- Фрагмент: «{_cell(q, 300)}» — {loc.human()}", f"- Суть: {f.explanation}", ""]
     out = [f"**{f.fid}** · {SEV_ICON.get(f.severity, '')} {f.severity} · {_crit_name(f.criterion)}"
            f"{' · источник: ' + f.source if f.source != 'LLM' else ''} — **{_cell(f.title)}**", ""]
     if len(f.evidence) == 1:
@@ -55,6 +60,8 @@ def build_markdown(res: RunResult) -> str:
     p = res.provider
     req_f = {r.rid: [f for f in fs if f.scope == "requirement" and r.rid in f.req_ids] for r in reqs}
     set_f = [f for f in fs if f.scope in ("set", "rule")]
+    dups = [f for f in fs if f.dup_of is not None]
+    fs = res.unique_findings          # всё, что считается в итогах, — без повторов
     sev = Counter(f.severity for f in fs)
     dur = (res.finished - res.started).total_seconds()
     L: list[str] = []
@@ -120,12 +127,13 @@ def build_markdown(res: RunResult) -> str:
 
     # 4. Проверка требований -----------------------------------------------------
     L += ["## 4. Проверка каждого требования", "", "### 4.1. Матрица соответствия критериям", "",
-          "✔ — нарушений не выявлено, ✖ — есть нарушение (число дефектов).", "",
+          "✔ — нарушений не выявлено, ✖ — есть нарушение (число замечаний), — — требование не оценено моделью.", "",
           "| Требование | " + " | ".join(REQ_CRITERIA) + " | Дефекты |",
           "| :--- | " + " | ".join(":-:" for _ in REQ_CRITERIA) + " | :-: |"]
     for r in reqs:
         cnt = Counter(f.criterion for f in req_f[r.rid])
-        cells = [("✖" + (str(cnt[c]) if cnt[c] > 1 else "")) if cnt[c] else "✔" for c in REQ_CRITERIA]
+        ok = "—" if r.rid in res.unchecked else "✔"   # не оценено моделью → «нарушений нет» утверждать нельзя
+        cells = [("✖" + (str(cnt[c]) if cnt[c] > 1 else "")) if cnt[c] else ok for c in REQ_CRITERIA]
         mark = "" if r.rid not in res.unchecked else " ⚠ не проверено"
         L.append(f"| {r.rid} ({_cell(r.doc_id)}){mark} | " + " | ".join(cells) + f" | {len(req_f[r.rid])} |")
     L += ["", "### 4.2. Замечания по требованиям", ""]
@@ -143,7 +151,8 @@ def build_markdown(res: RunResult) -> str:
             L += ["✔ Нарушений критериев C1–C9 не выявлено.", ""]
             continue
         for f in items:
-            related = [s.fid for s in set_f if r.rid in s.req_ids and any(_overlap(loc, l2) for _, loc in s.evidence for _, l2 in f.evidence)]
+            related = [s.fid for s in set_f if f.dup_of is None and r.rid in s.req_ids
+                       and any(_overlap(loc, l2) for _, loc in s.evidence for _, l2 in f.evidence)]
             L += _finding_block(f, related)
 
     # 5. Набор ---------------------------------------------------------------
@@ -171,9 +180,11 @@ def build_markdown(res: RunResult) -> str:
     L += ["## 6. Сводка", "", "| Показатель | Значение |", "| :--- | :--- |",
           f"| Требований выделено | {len(reqs)} |",
           f"| Требований с нарушениями | {with_def} из {len(reqs)} |",
-          f"| Требований без нарушений | {len(reqs) - with_def - len(res.unchecked)} |",
+          f"| Требований без нарушений | {sum(1 for r in reqs if not req_f[r.rid] and r.rid not in res.unchecked)} |",
+          f"| Требований не оценено моделью | {len(res.unchecked)} |",
           f"| Всего дефектов | {len(fs)} |",
           f"| — по отдельным требованиям | {sum(1 for f in fs if f.scope == 'requirement')} |",
+          f"| Повторов дефектов набора в замечаниях к требованиям (учтены один раз) | {len(dups)} |",
           f"| — по набору и документу | {len(set_f)} |",
           f"| 🔴 критичных | {sev['критичный']} |", f"| 🟠 значительных | {sev['значительный']} |",
           f"| 🟡 незначительных | {sev['незначительный']} |", ""]
@@ -232,7 +243,7 @@ def build_json(res: RunResult) -> dict:
                 "usage": asdict(res.provider.usage) if res.provider else None},
         "requirements": [{"id": r.rid, "doc_id": r.doc_id, "kind": r.kind, "summary": r.summary, "quote": r.quote,
                           "location": loc(r.location), "anchored": r.anchored} for r in res.requirements],
-        "findings": [{"id": f.fid, "scope": f.scope, "criterion": f.criterion, "severity": f.severity, "title": f.title,
+        "findings": [{"id": f.fid, "duplicate_of": f.dup_of.fid if f.dup_of else None, "scope": f.scope, "criterion": f.criterion, "severity": f.severity, "title": f.title,
                       "explanation": f.explanation, "recommendation": f.recommendation, "requirements": f.req_ids,
                       "evidence": [{"quote": q, "location": loc(l)} for q, l in f.evidence], "source": f.source}
                      for f in res.findings],

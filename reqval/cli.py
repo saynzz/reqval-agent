@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     for p in paths:
         log.info("Отчёт: %s", p)
-    log.info("Готово: требований %d, дефектов %d, итог: %s", len(res.requirements), len(res.findings), res.verdict.status)
+    log.info("Готово: требований %d, дефектов %d, итог: %s", len(res.requirements), len(res.unique_findings), res.verdict.status)
     if provider is not None and provider.usage.cost_usd:
         log.info("Стоимость прогона: $%.4f", provider.usage.cost_usd)
     if not res.complete:

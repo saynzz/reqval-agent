@@ -101,8 +101,6 @@ class MessyModel(BaseProvider):
                 LLMReqAssessment(req_id="R-77", issues=[_issue_q("C1", "в течение минуты")]),          # такого нет
             ])
         if schema is LLMSetResult:
-            if "согласованность" not in system:   # дубли между проходами — отдельная задача (дедупликация)
-                return LLMSetResult(issues=[])
             return LLMSetResult(issues=[LLMSetIssue(
                 criterion="Ѕ2", severity="критичный", title="Ф-2 против Ф-3", explanation="e", recommendation="r",
                 evidence=[LLMEvidence(req_id="Р-2", quote="по дате совершения покупки"),

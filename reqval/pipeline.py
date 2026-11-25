@@ -9,6 +9,7 @@ from typing import Optional
 
 from . import prompts, rules
 from .anchor import Anchorer
+from .dedup import dedupe
 from .criteria import CRITICAL_CRITERIA, SEVERITY_ORDER, normalize_rid
 from .llm import BaseProvider, LLMError
 from .models import (Document, Finding, LLMExtraction, LLMReqBatch, LLMSetResult, LLMVerdict,
@@ -56,6 +57,11 @@ class RunResult:
     rejected: list[Rejected] = field(default_factory=list)  # отброшенные замечания модели
     failed_steps: list[str] = field(default_factory=list)   # шаги, на которых LLM не ответила
     extraction: str = "LLM"                                  # LLM / правила / правила (ошибка LLM)
+
+    @property
+    def unique_findings(self) -> list[Finding]:
+        """Дефекты без повторов: замечание по требованию, повторяющее дефект набора, считается один раз."""
+        return [f for f in self.findings if f.dup_of is None]
 
     @property
     def complete(self) -> bool:
@@ -252,8 +258,8 @@ class Pipeline:
         rh = "\n".join(f"- {h.title}: «{h.quote[:80]}» ({h.location.human()})" for h in rule_hits) or "нет"
         text = self.doc.numbered_text()
         by_id = {r.rid: r for r in reqs}
-        for label, system in (("проверка набора: согласованность", prompts.SET_SYSTEM_CONSISTENCY),
-                              ("проверка набора: полнота", prompts.SET_SYSTEM_COMPLETENESS)):
+        # Один проход по всем S1–S8: два отдельных прохода давали дубли и лишний запрос к модели.
+        for label, system in (("проверка набора", prompts.SET_SYSTEM),):
             log.info(label)
             try:
                 res = self.llm.generate(system, prompts.SET_USER.format(name=self.doc.name, text=text,
@@ -369,17 +375,27 @@ class Pipeline:
             findings.append(Finding("", "rule", h.criterion, h.severity, h.title, h.explanation, h.recommendation,
                                     [owner.rid] if owner and h.rule != "R8" else [], [(h.quote, h.location)], source="правило"))
 
-        # нумерация дефектов: по требованиям (в порядке документа), затем набор, затем формальные
+        findings, n_merged, n_linked = dedupe(findings)
+        if n_merged or n_linked:
+            self.notes.append(f"Дедупликация: склеено одинаковых замечаний — {n_merged}; замечаний по требованиям, "
+                              f"повторяющих дефект набора, — {n_linked} (в сводке учтены один раз).")
+
+        # нумерация дефектов: по требованиям (в порядке документа), затем набор, затем формальные.
+        # Повторы дефекта набора номера не получают — ссылаются на номер дефекта набора.
         order = {r.rid: i for i, r in enumerate(reqs)}
         scope_rank = {"requirement": 0, "set": 1, "rule": 2}
         findings.sort(key=lambda f: (scope_rank[f.scope],
                                      order.get(f.req_ids[0], 10**6) if f.scope == "requirement" else 0,
                                      SEVERITY_ORDER.get(f.severity, 3),
                                      min(loc.line_from for _, loc in f.evidence)))
-        for i, f in enumerate(findings, 1):
+        unique = [f for f in findings if f.dup_of is None]
+        for i, f in enumerate(unique, 1):
             f.fid = f"D-{i:03d}"
+        for f in findings:
+            if f.dup_of is not None:
+                f.fid = f"↪{f.dup_of.fid}"
 
-        verdict = self.verdict(reqs, findings, unchecked)
+        verdict = self.verdict(reqs, unique, unchecked)
         if self.rejected:
             log.warning("Отброшено замечаний модели без подтверждённой цитаты: %d (см. приложение отчёта)",
                         len(self.rejected))
