@@ -123,7 +123,8 @@ def build_markdown(res: RunResult) -> str:
         ("Обращений к модели", (f"{p.usage.calls} (повторов: {p.usage.retries}); токенов: вход "
                                 f"{p.usage.input_tokens:,}".replace(",", " ") + ", выход "
                                 + f"{p.usage.output_tokens:,}".replace(",", " ")
-                                + (f"; стоимость ${p.usage.cost_usd:.4f}" if p.usage.cost_usd else "")) if p else "0"),
+                                + (f"; стоимость ${p.usage.cost_usd:.4f}" if p.usage.cost_usd else "")
+                                + (f"; параллельно до {p.concurrency} запросов" if p.concurrency > 1 else "")) if p else "0"),
         ("Журнал обращений к модели", _journal_line(p) if p else "—"),
         ("Стандарты", "ISO/IEC/IEEE 29148:2018 п. 5.2.5, 5.2.6, 5.2.7; IEEE Std 830-1998 п. 4.3"),
     ]

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -95,6 +96,29 @@ def _extract_json(text: str) -> str:
 class BaseProvider:
     name = "base"
     model = ""
+    default_concurrency = 1
+
+    # finish_reason и стоимость последнего ответа пишет _raw, читает _attempts того же потока.
+    @property
+    def last_finish(self) -> str | None:
+        return getattr(self._tls, "finish", None)
+
+    @last_finish.setter
+    def last_finish(self, value: str | None) -> None:
+        self._tls.finish = value
+
+    @property
+    def last_cost(self) -> float:
+        return getattr(self._tls, "cost", 0.0)
+
+    @last_cost.setter
+    def last_cost(self, value: float) -> None:
+        self._tls.cost = value
+
+    def _add_usage(self, **kw) -> None:
+        with self._lock:
+            for k, v in kw.items():
+                setattr(self.usage, k, getattr(self.usage, k) + v)
 
     def __init__(self) -> None:
         self.usage = Usage()
@@ -111,7 +135,10 @@ class BaseProvider:
         self.primary_model = ""
         self.tripped: str | None = None       # причина срабатывания предохранителя
         self._failed_in_row = 0
-        self.last_finish: str | None = None   # finish_reason последнего ответа (заполняет _raw)
+        # Параллельные запросы (пакеты проверки и проверка набора). Для бесплатного Gemini — 1: лимит RPM.
+        self.concurrency = max(1, int(os.getenv("LLM_CONCURRENCY", str(self.default_concurrency))))
+        self._lock = threading.RLock()        # счётчики, журнал, предохранитель, режимы — общие для потоков
+        self._tls = threading.local()         # finish_reason и стоимость последнего ответа — у каждого потока свои
         self._last_call = 0.0
 
     def describe(self) -> str:
@@ -156,9 +183,10 @@ class BaseProvider:
         rec = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "provider": self.name,
                "model": self.model, "params": self.describe(), **rec}
         try:
-            with open(self.journal_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            self.usage.journal_records += 1
+            line = json.dumps(rec, ensure_ascii=False) + "\n"
+            with self._lock, open(self.journal_path, "a", encoding="utf-8") as f:
+                f.write(line)
+                self.usage.journal_records += 1
         except OSError as e:
             log.warning("Журнал обращений не записан: %s", e)
 
@@ -193,11 +221,13 @@ class BaseProvider:
     # ------------------------------------------------------------------ обращение к модели
     def generate(self, system: str, prompt: str, schema: type[T], label: str = "") -> T:
         """Один шаг конвейера: кэш → попытки → (при недоступности) запасная модель → предохранитель."""
-        if not self.primary_model:
-            self.primary_model = self.model
+        with self._lock:
+            if not self.primary_model:
+                self.primary_model = self.model
         sys_h, prm_h = _sha(system), _sha(prompt)
         if self.tripped:
-            self.usage.skipped.append(label)
+            with self._lock:
+                self.usage.skipped.append(label)
             self._journal(step=label, outcome="skipped", error=self.tripped, system_sha256=sys_h, prompt_sha256=prm_h)
             raise CircuitOpen(f"[{label}] шаг пропущен: модель недоступна ({self.tripped})")
 
@@ -206,21 +236,28 @@ class BaseProvider:
         if cached is not None:
             try:
                 res = schema.model_validate_json(_extract_json(cached))
-                self.usage.cached += 1
-                self.usage.steps[label] = self.model
+                with self._lock:
+                    self.usage.cached += 1
+                    self.usage.steps[label] = self.model
                 self._journal(step=label, outcome="cache", system_sha256=sys_h, prompt_sha256=prm_h, response=cached)
                 return res
             except (ValidationError, json.JSONDecodeError):
                 pass
 
+        started_on = self.model
         try:
             res, text = self._attempts(system, prompt, schema, label, sys_h, prm_h)
         except Unavailable as e:
-            if self.fallback_model and self.model != self.fallback_model:
-                log.warning("[%s] модель %s недоступна — переключаюсь на запасную %s", label, self.model,
-                            self.fallback_model)
-                self._journal(step=label, outcome="fallback", error=str(e)[:300], next_model=self.fallback_model)
-                self._switch_model(self.fallback_model)
+            # Повторяем шаг на запасной, только если он начинался не на ней (иначе это та же недоступность).
+            if self.fallback_model and started_on != self.fallback_model:
+                with self._lock:
+                    switch = self.model != self.fallback_model   # другой поток мог уже переключить
+                    if switch:
+                        log.warning("[%s] модель %s недоступна — переключаюсь на запасную %s", label, self.model,
+                                    self.fallback_model)
+                        self._journal(step=label, outcome="fallback", error=str(e)[:300],
+                                      next_model=self.fallback_model)
+                        self._switch_model(self.fallback_model)
                 try:
                     res, text = self._attempts(system, prompt, schema, label, sys_h, prm_h)
                 except LLMError as e2:
@@ -232,8 +269,9 @@ class BaseProvider:
         except LLMError as e:
             self._step_failed(label, e)
             raise
-        self._failed_in_row = 0
-        self.usage.steps[label] = self.model
+        with self._lock:
+            self._failed_in_row = 0
+            self.usage.steps[label] = self.model
         self._cache_put(key, text, label)
         return res
 
@@ -241,6 +279,10 @@ class BaseProvider:
         """Предохранитель: если модель недоступна несколько шагов подряд, дальше не ждём на каждом шаге
         по несколько минут повторов, а сразу пишем отчёт с итогом «ПРОВЕРКА НЕ ЗАВЕРШЕНА».
         Плохие ответы (схема, обрезка) — не недоступность: модель отвечает, предохранитель их не считает."""
+        with self._lock:
+            self._step_failed_locked(label, e)
+
+    def _step_failed_locked(self, label: str, e: LLMError) -> None:
         self.usage.errors.append(f"{label}: {e}")
         if isinstance(e, (SchemaError, TruncatedError)):
             return
@@ -255,30 +297,32 @@ class BaseProvider:
         note = ""
         transient = False
         for attempt in range(1, self.max_retries + 1):
-            wait = self.min_interval - (time.time() - self._last_call)
-            if wait > 0:
-                time.sleep(wait)
+            with self._lock:               # пауза между запросами — общая для всех потоков
+                now = time.time()
+                start = max(now, self._last_call + self.min_interval)
+                self._last_call = start
+            if start > now:
+                time.sleep(start - now)
             t0 = time.time()
-            cost0 = self.usage.cost_usd
+            self.last_cost = 0.0
             base = dict(step=label, attempt=attempt, system_sha256=sys_h, prompt_sha256=prm_h,
                         prompt_chars=len(prompt + note))
             try:
-                self._last_call = time.time()
                 self.last_finish = None
                 text, tin, tout = self._raw(system, prompt + note, schema)
             except Exception as e:  # noqa: BLE001
                 dt = time.time() - t0
-                self.usage.seconds += dt
+                self._add_usage(seconds=dt)
                 ok, delay = self._retryable(e)
                 self._journal(**base, outcome="error", seconds=round(dt, 2), error=str(e)[:500],
-                              cost_usd=round(self.usage.cost_usd - cost0, 6))
+                              cost_usd=round(self.last_cost, 6))
                 last_err = e
                 if not ok:
                     if isinstance(e, LLMError):
                         raise type(e)(f"[{label}] ошибка LLM: {e}") from e
                     raise LLMError(f"[{label}] ошибка LLM: {e}") from e
                 transient = True
-                self.usage.retries += 1
+                self._add_usage(retries=1)
                 if attempt == self.max_retries:
                     break
                 sleep = delay if delay else min(60, 5 * 2 ** (attempt - 1))
@@ -288,12 +332,9 @@ class BaseProvider:
                 continue
 
             dt = time.time() - t0
-            self.usage.calls += 1
-            self.usage.input_tokens += tin
-            self.usage.output_tokens += tout
-            self.usage.seconds += dt
+            self._add_usage(calls=1, input_tokens=tin, output_tokens=tout, seconds=dt)
             rec = dict(**base, seconds=round(dt, 2), finish=self.last_finish, input_tokens=tin, output_tokens=tout,
-                       cost_usd=round(self.usage.cost_usd - cost0, 6), response=text)
+                       cost_usd=round(self.last_cost, 6), response=text)
             log.debug("[%s] ответ за %.1f c: вход %d, выход %d токенов, finish=%s", label, dt, tin, tout,
                       self.last_finish)
             try:
@@ -309,7 +350,7 @@ class BaseProvider:
                         + (f" Сырой ответ: {dump}" if dump else ""))
                 last_err = ve
                 transient = False
-                self.usage.retries += 1
+                self._add_usage(retries=1)
                 note = ("\n\nПредыдущий ответ не прошёл валидацию JSON-схемы: "
                         f"{str(ve)[:400]}. Верни строго валидный JSON по схеме.")
                 log.warning("[%s] ответ не прошёл проверку схемы (finish=%s, выход %d токенов): %s — повтор %d/%d%s",
@@ -440,6 +481,7 @@ class OpenRouterProvider(OpenAICompatProvider):
     поддерживают (provider.require_parameters). Стоимость прогона берётся из ответа OpenRouter."""
 
     name = "OpenRouter"
+    default_concurrency = 4
 
     def __init__(self, model: str | None = None) -> None:
         BaseProvider.__init__(self)
@@ -559,23 +601,36 @@ class OpenRouterProvider(OpenAICompatProvider):
     def _no_endpoints(e: LLMError) -> bool:
         return getattr(e, "code", None) == 404 and "no endpoints found" in (getattr(e, "detail", "") or "").lower()
 
+    def _advance_mode(self, used: int) -> bool:
+        """Спуск на следующую ступень после 404. Если параллельный запрос уже спустился с этой ступени,
+        второй раз не спускаемся — иначе две одновременные 404 перескочили бы через рабочий режим."""
+        with self._lock:
+            if self.mode != used:
+                return True
+            if self.mode + 1 >= len(self.MODES):
+                return False
+            self.mode += 1
+            log.warning("OpenRouter: для %s нет провайдера с такими параметрами — режим «%s»",
+                        self.model, self.MODES[self.mode]["name"])
+            return True
+
     def _raw(self, system, prompt, schema):
         while True:
+            used = self.mode
             try:
                 data = self._post(self._body(system, prompt, schema))
                 break
             except LLMError as e:
-                if not self._no_endpoints(e) or self.mode + 1 >= len(self.MODES):
+                if not self._no_endpoints(e) or not self._advance_mode(used):
                     raise
-                self.mode += 1
-                log.warning("OpenRouter: для %s нет провайдера с такими параметрами — режим «%s»",
-                            self.model, self.MODES[self.mode]["name"])
         if "error" in data:
             err = LLMError(f"OpenRouter: {data['error']}")
             err.code = (data["error"] or {}).get("code") if isinstance(data["error"], dict) else None
             raise err
         u = data.get("usage") or {}
-        self.usage.cost_usd += float(u.get("cost") or 0)
+        cost = float(u.get("cost") or 0)
+        self.last_cost += cost
+        self._add_usage(cost_usd=cost)
         msg = data["choices"][0]["message"]
         content = msg.get("content") or ""
         for call in msg.get("tool_calls") or []:          # режим tool calling: ответ — аргументы вызова

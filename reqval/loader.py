@@ -94,7 +94,61 @@ def _load_txt(text: str) -> tuple[list[Line], str | None]:
 # PDF
 # ---------------------------------------------------------------------------
 
+_LIST_START = re.compile(r"^(•|·|-|–|—|\*|\d{1,2}[.)]\s|\d{3}\.|[A-ZА-Я]{1,4}-\d|Ф-\d)")
+
+
+def _join_wrapped(parts: list[str]) -> str:
+    """Склейка строк, перенесённых вёрсткой: «бизнес-» + «процесса» → «бизнес-процесса», иначе через пробел."""
+    out = ""
+    for p in (x.strip() for x in parts):
+        if not p:
+            continue
+        if out.endswith("-") and not out.endswith(" -") and len(out) > 1 and out[-2].isalpha():
+            out += p
+        else:
+            out = f"{out} {p}" if out else p
+    return out
+
+
+COLUMN_GAP_EM = 1.0   # разрыв между символами строки шире 1 em — граница колонок (обычный пробел ≈ 0.25–0.6 em)
+
+
+def _columns(chars: list[dict]) -> list[str]:
+    """Делит строку на колонки по широким разрывам. Одна колонка — обычная строка текста."""
+    chars = sorted(chars, key=lambda c: c["x0"])
+    cols: list[list[dict]] = [[chars[0]]]
+    for prev, c in zip(chars, chars[1:]):
+        if c["x0"] - prev["x1"] > COLUMN_GAP_EM * max(prev["size"], c["size"]):
+            cols.append([c])
+        else:
+            cols[-1].append(c)
+    if len(cols) == 1:
+        return [""]
+
+    def text(cs: list[dict]) -> str:
+        out = cs[0]["text"]
+        for a, b in zip(cs, cs[1:]):
+            out += (" " if b["x0"] - a["x1"] > 0.15 * b["size"] else "") + b["text"]
+        return _clean_inline(out)
+
+    return [text(cs) for cs in cols]
+
+
+def _in_box(tl: dict, box: tuple[float, float, float, float]) -> bool:
+    x0, top, x1, bottom = box
+    cy = (tl["top"] + tl["bottom"]) / 2
+    return top - 1 <= cy <= bottom + 1 and tl["x1"] > x0 and tl["x0"] < x1
+
+
 def _load_pdf(path: Path) -> tuple[list[Line], str | None]:
+    """PDF с текстовым слоем.
+
+    - Таблицы (pdfplumber.find_tables) читаются как таблицы: строка таблицы → одна строка документа с ячейками
+      через « | », как в Markdown. Без этого ячейки склеиваются в сплошной текст, длинная ячейка рвётся на
+      несколько строк, а шапка таблицы принимается за заголовок раздела.
+    - Строки абзаца, перенесённые вёрсткой, склеиваются обратно: требование «Ф-1» — одна строка, а не три.
+    - Заголовки определяются по шрифту (крупнее или жирнее основного текста), таблицы в этом не участвуют.
+    """
     import pdfplumber
 
     from collections import Counter, defaultdict
@@ -102,54 +156,97 @@ def _load_pdf(path: Path) -> tuple[list[Line], str | None]:
     def font(c: dict) -> str:
         return c.get("fontname", "").split("+")[-1]
 
-    raw: list[dict] = []  # {text, page, style, uniform}
+    raw: list[dict] = []  # {text, page, style, uniform, nchars, top, bottom, table}
     with pdfplumber.open(str(path)) as pdf:
         for pno, page in enumerate(pdf.pages, start=1):
+            try:
+                tables = page.find_tables()
+            except Exception:  # noqa: BLE001 — битая разметка таблицы не должна ронять чтение
+                tables = []
+            boxes = [t.bbox for t in tables]
+            items: list[dict] = []
+            for t, box in zip(tables, boxes):
+                seen_text = False
+                for row in t.extract():
+                    cells = [_clean_inline(_join_wrapped((c or "").split("\n"))) for c in row]
+                    if not any(cells) and not seen_text:
+                        continue   # пустые строки в начале таблицы — артефакт разрыва таблицы между страницами
+                    seen_text = seen_text or any(cells)
+                    items.append({"text": " | ".join(cells), "page": pno, "style": None, "uniform": False,
+                                  "nchars": 0, "top": box[1], "bottom": box[1], "table": True})
+                # строки одной таблицы — подряд, в порядке строк
             for tl in page.extract_text_lines(layout=False, strip=True):
+                if any(_in_box(tl, box) for box in boxes):
+                    continue
                 chars = [c for c in tl.get("chars", []) if c.get("text", "").strip()]
                 if not chars:
                     continue
                 fc = Counter((font(c), round(c["size"], 1)) for c in chars)
                 style, n = fc.most_common(1)[0]
-                raw.append({"text": _clean_inline(tl["text"]), "page": pno, "style": style,
-                            "uniform": n / len(chars) >= 0.95, "nchars": len(chars)})
+                cols = _columns(chars)
+                if len(cols) > 1:   # строка таблицы без рамок: колонки разделены широким разрывом
+                    items.append({"text": " | ".join(cols), "page": pno, "style": style, "uniform": False,
+                                  "nchars": len(chars), "top": tl["top"], "bottom": tl["bottom"], "table": True})
+                    continue
+                items.append({"text": _clean_inline(tl["text"]), "page": pno, "style": style,
+                              "uniform": n / len(chars) >= 0.95, "nchars": len(chars),
+                              "top": tl["top"], "bottom": tl["bottom"], "table": False})
+            items.sort(key=lambda r: r["top"])   # sort устойчив: строки таблицы сохраняют порядок
+            raw += items
 
-    if not raw:
+    if not any(r["text"] for r in raw):
         raise ValueError("В PDF не найден текстовый слой (возможно, это скан). Нужен PDF с текстом.")
 
     # Основной стиль — тот, которым набрано больше всего символов. Стиль заголовка — отличается от
     # основного, применяется только к коротким однородным строкам без завершающей пунктуации.
+    text_rows = [r for r in raw if not r["table"]]
     chars_by_style: Counter = Counter()
     lines_by_style: dict = defaultdict(list)
-    for r in raw:
+    for r in text_rows:
         chars_by_style[r["style"]] += r["nchars"]
         lines_by_style[r["style"]].append(r)
-    body_style = chars_by_style.most_common(1)[0][0]
-    body_size = body_style[1]
-
     heading_styles = []
-    for st, rs in lines_by_style.items():
-        if st == body_style or st[1] < body_size * 0.95:
-            continue
-        name = st[0].lower()
-        emph = st[1] > body_size * 1.05 or "bold" in name or "italic" in name or "oblique" in name
-        share = sum(1 for r in rs if r["uniform"] and len(r["text"]) < 90) / len(rs)
-        if emph and share >= 0.8 and len(rs) <= max(3, len(raw) * 0.3):
-            heading_styles.append(st)
+    if chars_by_style:
+        body_style = chars_by_style.most_common(1)[0][0]
+        body_size = body_style[1]
+        for st, rs in lines_by_style.items():
+            if st == body_style or st[1] < body_size * 0.95:
+                continue
+            name = st[0].lower()
+            emph = st[1] > body_size * 1.05 or "bold" in name or "italic" in name or "oblique" in name
+            share = sum(1 for r in rs if r["uniform"] and len(r["text"]) < 90) / len(rs)
+            if emph and share >= 0.8 and len(rs) <= max(3, len(text_rows) * 0.3):
+                heading_styles.append(st)
 
     def rank(st: tuple) -> tuple:
         name = st[0].lower()
         return (-st[1], 0 if "bold" in name else 1)
 
     level_of = {st: i + 1 for i, st in enumerate(sorted(heading_styles, key=rank))}
+    for r in raw:
+        r["level"] = (level_of.get(r["style"]) if not r["table"] and r["uniform"] and len(r["text"]) < 90 else None)
+
+    # Склейка строк абзаца, перенесённых вёрсткой: тот же шрифт, та же страница, небольшой зазор,
+    # следующая строка не начинает новый пункт списка.
+    merged: list[dict] = []
+    for r in raw:
+        prev = merged[-1] if merged else None
+        if (prev and not r["table"] and not prev["table"] and not r["level"] and not prev["level"]
+                and r["page"] == prev["page"] and r["style"] == prev["style"]
+                and r["top"] - prev["bottom"] < 0.6 * (r["style"][1] if r["style"] else 10)
+                and not _LIST_START.match(r["text"])):
+            prev["text"] = _join_wrapped([prev["text"], r["text"]])
+            prev["bottom"] = r["bottom"]
+            continue
+        merged.append(dict(r))
 
     tr = _SectionTracker()
     lines: list[Line] = []
-    for r in raw:
-        level = level_of.get(r["style"]) if r["uniform"] and len(r["text"]) < 90 else None
-        if level:
-            tr.push(level, r["text"])
-        lines.append(Line(no=len(lines) + 1, text=r["text"], page=r["page"], section=tr.path, is_heading=bool(level)))
+    for r in merged:
+        if r["level"]:
+            tr.push(r["level"], r["text"])
+        lines.append(Line(no=len(lines) + 1, text=r["text"], page=r["page"], section=tr.path,
+                          is_heading=bool(r["level"])))
     return lines, tr.title
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -32,6 +33,16 @@ class Rejected:
     criterion: str
     title: str
     quote: str          # цитата модели, которую не нашли в тексте
+
+
+@dataclass
+class StepOut:
+    """Результат одного шага проверки (пакет требований или набор) — собирается по порядку шагов."""
+    findings: list = field(default_factory=list)
+    unchecked: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+    rejected: list = field(default_factory=list)
+    failed: list = field(default_factory=list)
 
 
 @dataclass
@@ -208,88 +219,129 @@ class Pipeline:
 
     # ------------------------------------------------------------------ per-requirement
     def check_requirements(self, reqs: list[Requirement], hints: dict[str, list[rules.RuleHit]]) -> tuple[list[Finding], list[str]]:
-        findings: list[Finding] = []
-        unchecked: list[str] = []
+        """Проверка требований пакетами (последовательно). Параллельный вариант — в _llm_checks."""
+        out = [self._check_batch(bi, batch, reqs, hints) for bi, batch in self._batches(reqs)]
+        self._merge(out)
+        return [f for o in out for f in o.findings], [r for o in out for r in o.unchecked]
+
+    def _batches(self, reqs: list[Requirement]) -> list[tuple[int, list[Requirement]]]:
+        return list(enumerate((reqs[i:i + self.batch_size] for i in range(0, len(reqs), self.batch_size)), 1))
+
+    def _merge(self, outs: list["StepOut"]) -> None:
+        """Заметки, отброшенные замечания и сбои шагов — в порядке шагов, а не в порядке ответов модели."""
+        for o in outs:
+            self.notes += o.notes
+            self.rejected += o.rejected
+            self.failed_steps += o.failed
+
+    def _check_batch(self, bi: int, batch: list[Requirement], reqs: list[Requirement],
+                     hints: dict[str, list[rules.RuleHit]]) -> "StepOut":
+        """Один пакет требований. Ничего общего не меняет — результат возвращается и собирается по порядку,
+        поэтому пакеты можно отправлять параллельно, а нумерация дефектов от этого не зависит."""
+        o = StepOut()
+        n_batches = (len(reqs) + self.batch_size - 1) // self.batch_size
         all_reqs = "\n".join(_fmt_req(r, 250) for r in reqs)
         by_id = {r.rid: r for r in reqs}
         text = self.doc.numbered_text()
-        batches = [reqs[i:i + self.batch_size] for i in range(0, len(reqs), self.batch_size)]
-        for bi, batch in enumerate(batches, 1):
-            pending = list(batch)
-            for attempt in range(2):
-                if not pending:
-                    break
-                hint_txt = "\n".join(f"- {h.req_id}: {h.title} — {h.explanation}"
-                                     for r in pending for h in hints.get(r.rid, [])) or "нет"
-                label = f"проверка требований {bi}/{len(batches)}" + (" (повтор)" if attempt else "")
-                log.info("%s: %s", label, ", ".join(r.rid for r in pending))
-                try:
-                    res = self.llm.generate(prompts.CHECK_SYSTEM, prompts.CHECK_USER.format(
-                        name=self.doc.name, text=text, all_reqs=all_reqs, n=len(pending),
-                        batch="\n".join(_fmt_req(r, 2000) for r in pending), hints=hint_txt),
-                        LLMReqBatch, label=label)
-                except LLMError as e:
-                    self.notes.append(f"{label}: ошибка LLM — {e}")
-                    break
-                got = set()
-                for a in res.assessments:
-                    req = self._resolve_req(a.req_id, by_id, pending)
-                    if req is None:
-                        self.notes.append(f"{label}: модель вернула оценку для неизвестного требования «{a.req_id}» — пропущена.")
+        pending = list(batch)
+        for attempt in range(2):
+            if not pending:
+                break
+            hint_txt = "\n".join(f"- {h.req_id}: {h.title} — {h.explanation}"
+                                 for r in pending for h in hints.get(r.rid, [])) or "нет"
+            label = f"проверка требований {bi}/{n_batches}" + (" (повтор)" if attempt else "")
+            log.info("%s: %s", label, ", ".join(r.rid for r in pending))
+            try:
+                res = self.llm.generate(prompts.CHECK_SYSTEM, prompts.CHECK_USER.format(
+                    name=self.doc.name, text=text, all_reqs=all_reqs, n=len(pending),
+                    batch="\n".join(_fmt_req(r, 2000) for r in pending), hints=hint_txt),
+                    LLMReqBatch, label=label)
+            except LLMError as e:
+                o.notes.append(f"{label}: ошибка LLM — {e}")
+                break
+            got = set()
+            for a in res.assessments:
+                req = self._resolve_req(a.req_id, by_id, pending)
+                if req is None:
+                    o.notes.append(f"{label}: модель вернула оценку для неизвестного требования «{a.req_id}» — пропущена.")
+                    continue
+                if req not in pending:      # уже оценено или не из этого пакета
+                    continue
+                got.add(req.rid)
+                for iss in a.issues:
+                    quote, loc = self._anchor_issue_quote(iss.quote, req)
+                    if loc is None:
+                        o.rejected.append(Rejected("requirement", req.rid, iss.criterion, iss.title.strip(),
+                                                   iss.quote.strip()))
                         continue
-                    if req not in pending:      # уже оценено или не из этого пакета
-                        continue
-                    got.add(req.rid)
-                    for iss in a.issues:
-                        quote, loc = self._anchor_issue_quote(iss.quote, req)
-                        if loc is None:
-                            self.rejected.append(Rejected("requirement", req.rid, iss.criterion, iss.title.strip(),
-                                                          iss.quote.strip()))
-                            continue
-                        findings.append(Finding("", "requirement", iss.criterion, iss.severity,
-                                                iss.title.strip(), iss.explanation.strip(), iss.recommendation.strip(),
-                                                [req.rid], [(quote, loc)]))
-                pending = [r for r in pending if r.rid not in got]
-            unchecked += [r.rid for r in pending]
-        return findings, unchecked
+                    o.findings.append(Finding("", "requirement", iss.criterion, iss.severity,
+                                              iss.title.strip(), iss.explanation.strip(), iss.recommendation.strip(),
+                                              [req.rid], [(quote, loc)]))
+            pending = [r for r in pending if r.rid not in got]
+        o.unchecked = [r.rid for r in pending]
+        return o
 
     # ------------------------------------------------------------------ set
     def check_set(self, reqs: list[Requirement], rule_hits: list[rules.RuleHit]) -> list[Finding]:
-        findings: list[Finding] = []
+        o = self._check_set_step(reqs, rule_hits)
+        self._merge([o])
+        return o.findings
+
+    def _check_set_step(self, reqs: list[Requirement], rule_hits: list[rules.RuleHit]) -> "StepOut":
+        # Один проход по всем S1–S8: два отдельных прохода давали дубли и лишний запрос к модели.
+        o = StepOut()
+        label = "проверка набора"
         all_reqs = "\n".join(_fmt_req(r, 600) for r in reqs)
         rh = "\n".join(f"- {h.title}: «{h.quote[:80]}» ({h.location.human()})" for h in rule_hits) or "нет"
-        text = self.doc.numbered_text()
         by_id = {r.rid: r for r in reqs}
-        # Один проход по всем S1–S8: два отдельных прохода давали дубли и лишний запрос к модели.
-        for label, system in (("проверка набора", prompts.SET_SYSTEM),):
-            log.info(label)
-            try:
-                res = self.llm.generate(system, prompts.SET_USER.format(name=self.doc.name, text=text,
-                                        all_reqs=all_reqs, rule_hits=rh), LLMSetResult, label=label)
-            except LLMError as e:
-                self.notes.append(f"{label}: ошибка LLM — {e}")
-                self.failed_steps.append(label)
-                continue
-            for iss in res.issues:
-                ev: list[tuple[str, Location]] = []
-                rids: list[str] = []
-                for e in iss.evidence:
-                    req = self._resolve_req(e.req_id, by_id, reqs)
-                    quote, loc = self._anchor_issue_quote(e.quote, req)
-                    if loc is None:
-                        self.notes.append(f"Набор: цитата «{e.quote[:60]}» к дефекту «{iss.title}» не найдена — исключена.")
-                        continue
-                    ev.append((quote, loc))
-                    owner = self._req_at(loc, reqs)
-                    if owner and owner.rid not in rids:
-                        rids.append(owner.rid)
-                if not ev:
-                    self.rejected.append(Rejected("set", ", ".join(e.req_id for e in iss.evidence) or "—", iss.criterion,
-                                                  iss.title.strip(), " … ".join(e.quote.strip() for e in iss.evidence)))
+        log.info(label)
+        try:
+            res = self.llm.generate(prompts.SET_SYSTEM, prompts.SET_USER.format(
+                name=self.doc.name, text=self.doc.numbered_text(), all_reqs=all_reqs, rule_hits=rh),
+                LLMSetResult, label=label)
+        except LLMError as e:
+            o.notes.append(f"{label}: ошибка LLM — {e}")
+            o.failed.append(label)
+            return o
+        for iss in res.issues:
+            ev: list[tuple[str, Location]] = []
+            rids: list[str] = []
+            for e in iss.evidence:
+                req = self._resolve_req(e.req_id, by_id, reqs)
+                quote, loc = self._anchor_issue_quote(e.quote, req)
+                if loc is None:
+                    o.notes.append(f"Набор: цитата «{e.quote[:60]}» к дефекту «{iss.title}» не найдена — исключена.")
                     continue
-                findings.append(Finding("", "set", iss.criterion, iss.severity, iss.title.strip(),
-                                        iss.explanation.strip(), iss.recommendation.strip(), rids, ev))
-        return findings
+                ev.append((quote, loc))
+                owner = self._req_at(loc, reqs)
+                if owner and owner.rid not in rids:
+                    rids.append(owner.rid)
+            if not ev:
+                o.rejected.append(Rejected("set", ", ".join(e.req_id for e in iss.evidence) or "—", iss.criterion,
+                                           iss.title.strip(), " … ".join(e.quote.strip() for e in iss.evidence)))
+                continue
+            o.findings.append(Finding("", "set", iss.criterion, iss.severity, iss.title.strip(),
+                                      iss.explanation.strip(), iss.recommendation.strip(), rids, ev))
+        return o
+
+    def _llm_checks(self, reqs: list[Requirement], req_hits: dict[str, list[rules.RuleHit]],
+                    doc_hits: list[rules.RuleHit]) -> tuple[list[Finding], list[str], list[Finding]]:
+        """Пакеты требований и проверка набора не зависят друг от друга. При concurrency > 1 они идут
+        параллельно; проверка набора — самый долгий запрос, поэтому отправляется первой."""
+        batches = self._batches(reqs)
+        workers = max(1, getattr(self.llm, "concurrency", 1))
+        if workers == 1:
+            outs = [self._check_batch(bi, b, reqs, req_hits) for bi, b in batches]
+            set_out = self._check_set_step(reqs, doc_hits)
+        else:
+            log.info("Параллельных запросов к модели: %d", min(workers, len(batches) + 1))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                set_fut = ex.submit(self._check_set_step, reqs, doc_hits)
+                futs = [ex.submit(self._check_batch, bi, b, reqs, req_hits) for bi, b in batches]
+                outs = [f.result() for f in futs]
+                set_out = set_fut.result()
+        self._merge(outs + [set_out])
+        return ([f for o in outs for f in o.findings], [r for o in outs for r in o.unchecked], set_out.findings)
 
     # ------------------------------------------------------------------ verdict
     @staticmethod
@@ -367,8 +419,7 @@ class Pipeline:
         findings: list[Finding] = []
         unchecked: list[str] = []
         if self.llm is not None:
-            fr, unchecked = self.check_requirements(reqs, req_hits)
-            fs = self.check_set(reqs, doc_hits)
+            fr, unchecked, fs = self._llm_checks(reqs, req_hits, doc_hits)
             findings += fr + fs
         rule_only = set(req_hits) if self.llm is None else set(unchecked) & set(req_hits)
         if rule_only:   # модель эти требования не оценила — оставляем хотя бы формальные находки

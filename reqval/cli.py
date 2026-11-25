@@ -25,6 +25,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model", default=None, help="Модель (по умолчанию GEMINI_MODEL из .env, иначе gemini-2.5-flash)")
     ap.add_argument("--batch-size", type=int, default=6, help="Требований в одном запросе проверки (по умолчанию 6)")
     ap.add_argument("--no-json", action="store_true", help="Не сохранять JSON-копию отчёта")
+    ap.add_argument("--concurrency", type=int, default=None, metavar="N",
+                    help="Параллельных запросов к модели (по умолчанию: Gemini — 1 из-за лимита бесплатного тарифа, "
+                         "OpenRouter — 4; или LLM_CONCURRENCY в .env)")
     ap.add_argument("--cache", nargs="?", const=".reqval_cache", default=None, metavar="DIR",
                     help="Брать повторяющиеся ответы модели из кэша (для отладки; по умолчанию выключено, "
                          "в паспорте отмечается). Каталог по умолчанию: .reqval_cache")
@@ -45,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         doc = load_document(a.input)
         provider = make_provider(a.provider, a.model)
+        if provider is not None and a.concurrency:
+            provider.concurrency = max(1, a.concurrency)
         if provider is not None:
             out = Path(a.output).resolve()
             out.parent.mkdir(parents=True, exist_ok=True)
