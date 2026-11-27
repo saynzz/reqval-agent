@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("input", help="Путь к документу требований (.pdf, .docx, .md, .txt)")
     ap.add_argument("output", help="Путь к файлу отчёта (.md или .html); рядом пишется .json")
     ap.add_argument("--provider", default=None, help="openrouter (по умолчанию, модель anthropic/claude-sonnet-5.5) | gemini (бесплатно) | openai | offline")
-    ap.add_argument("--model", default=None, help="Модель (по умолчанию GEMINI_MODEL из .env, иначе gemini-2.5-flash)")
+    ap.add_argument("--model", default=None, help="Модель провайдера (по умолчанию из .env; иначе OpenRouter — anthropic/claude-sonnet-5.5, Gemini — gemini-3.8-flash)")
     ap.add_argument("--batch-size", type=int, default=6, help="Требований в одном запросе проверки (по умолчанию 6)")
     ap.add_argument("--no-json", action="store_true", help="Не сохранять JSON-копию отчёта")
     ap.add_argument("--concurrency", type=int, default=None, metavar="N",
