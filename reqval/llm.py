@@ -39,6 +39,13 @@ class Usage:
     errors: list[str] = field(default_factory=list)
 
 
+# Модель, на которой сделан сдаваемый отчёт (README, examples/). Бесплатная альтернатива — Gemini.
+DEFAULT_PROVIDER = "openrouter"
+DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-5.5"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_FALLBACK = "gemini-3.5-flash-lite"   # при перегрузке 3.8 Flash (503) и для большего дневного лимита
+
+
 class LLMError(RuntimeError):
     pass
 
@@ -97,6 +104,7 @@ class BaseProvider:
     name = "base"
     model = ""
     default_concurrency = 1
+    default_min_interval = 0.0
 
     # finish_reason и стоимость последнего ответа пишет _raw, читает _attempts того же потока.
     @property
@@ -124,7 +132,8 @@ class BaseProvider:
         self.usage = Usage()
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0"))
         self.max_retries = int(os.getenv("LLM_MAX_RETRIES", "6"))
-        self.min_interval = float(os.getenv("LLM_MIN_INTERVAL", "0"))
+        # Пауза между запросами: у бесплатного Gemini лимит запросов в минуту, у платного OpenRouter его нет.
+        self.min_interval = float(os.getenv("LLM_MIN_INTERVAL") or self.default_min_interval)
         self.max_output_tokens = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "32768"))
         self.reasoning_effort = (os.getenv("LLM_REASONING_EFFORT") or "").strip().lower() or None
         self.debug_dir = os.getenv("LLM_DEBUG_DIR") or None
@@ -366,6 +375,7 @@ class BaseProvider:
 
 class GeminiProvider(BaseProvider):
     name = "Google Gemini API"
+    default_min_interval = 4.0     # бесплатный тариф: лимит запросов в минуту
 
     def __init__(self, model: str | None = None) -> None:
         super().__init__()
@@ -376,8 +386,9 @@ class GeminiProvider(BaseProvider):
         from google import genai
 
         self.client = genai.Client(api_key=key)
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        self.fallback_model = (os.getenv("GEMINI_FALLBACK_MODEL") or "").strip() or self.fallback_model
+        self.model = model or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+        self.fallback_model = ((os.getenv("GEMINI_FALLBACK_MODEL") or "").strip() or self.fallback_model
+                               or (DEFAULT_GEMINI_FALLBACK if self.model != DEFAULT_GEMINI_FALLBACK else None))
 
     def _raw(self, system, prompt, schema):
         from google.genai import types
@@ -483,17 +494,6 @@ class OpenRouterProvider(OpenAICompatProvider):
     name = "OpenRouter"
     default_concurrency = 4
 
-    def __init__(self, model: str | None = None) -> None:
-        BaseProvider.__init__(self)
-        self.base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-        self.key = os.getenv("OPENROUTER_API_KEY", "")
-        self.model = model or os.getenv("OPENROUTER_MODEL", "")
-        if not self.key or self.key.startswith("your_"):
-            raise LLMError("Не задан OPENROUTER_API_KEY (https://openrouter.ai/settings/keys)")
-        if not self.model:
-            raise LLMError("Не задан OPENROUTER_MODEL — точный id модели со страницы openrouter.ai, "
-                           "например google/gemini-3.1-pro-preview")
-
     # Лестница совместимости. Не у каждой модели на OpenRouter есть провайдер, поддерживающий ВСЕ параметры
     # запроса (например, Anthropic не принимает seed). Тогда OpenRouter отвечает 404 «No endpoints found that
     # can handle the requested parameters», и агент спускается на ступень ниже, запоминая её до конца прогона.
@@ -530,11 +530,12 @@ class OpenRouterProvider(OpenAICompatProvider):
         BaseProvider.__init__(self)
         self.base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
         self.key = os.getenv("OPENROUTER_API_KEY", "")
-        self.model = model or os.getenv("OPENROUTER_MODEL", "")
+        self.model = model or os.getenv("OPENROUTER_MODEL") or DEFAULT_OPENROUTER_MODEL
         self.mode = self._start_mode(self.model)
         self.fallback_model = (os.getenv("OPENROUTER_FALLBACK_MODEL") or "").strip() or self.fallback_model
         if not self.key or self.key.startswith("your_"):
-            raise LLMError("Не задан OPENROUTER_API_KEY (https://openrouter.ai/settings/keys)")
+            raise LLMError("Не задан OPENROUTER_API_KEY. Получите ключ на https://openrouter.ai/settings/keys, "
+                           "впишите его в .env (см. README) — или запустите на бесплатном Gemini: --provider gemini")
         if not self.model:
             raise LLMError("Не задан OPENROUTER_MODEL — точный id модели со страницы openrouter.ai, "
                            "например google/gemini-3.1-pro-preview")
@@ -648,7 +649,7 @@ class OpenRouterProvider(OpenAICompatProvider):
 
 
 def make_provider(kind: str, model: str | None) -> BaseProvider | None:
-    kind = (kind or os.getenv("LLM_PROVIDER", "gemini")).lower()
+    kind = (kind or os.getenv("LLM_PROVIDER") or DEFAULT_PROVIDER).lower()
     if kind == "offline":
         return None
     if kind == "gemini":

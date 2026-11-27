@@ -105,12 +105,24 @@ def test_no_balance_fails_fast_with_reason(server):
 
 def test_config_errors_are_explicit(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    with pytest.raises(LLMError, match="OPENROUTER_API_KEY"):
+    with pytest.raises(LLMError, match="OPENROUTER_API_KEY.*openrouter.ai/settings/keys.*--provider gemini"):
         OpenRouterProvider("google/x")
+
+
+def test_defaults_are_the_submission_model(monkeypatch):
+    """По умолчанию — модель, на которой сделан сдаваемый отчёт: OpenRouter + Claude Sonnet 5.5."""
+    from reqval.llm import GeminiProvider, make_provider
+    for var in ("LLM_PROVIDER", "OPENROUTER_MODEL", "GEMINI_MODEL", "GEMINI_FALLBACK_MODEL", "LLM_FALLBACK_MODEL",
+                "OPENROUTER_MODE"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
-    with pytest.raises(LLMError, match="OPENROUTER_MODEL"):
-        OpenRouterProvider()
+    p = make_provider(None, None)
+    assert isinstance(p, OpenRouterProvider) and p.model == "anthropic/claude-sonnet-5.5"
+    assert p.mode == 2, "Claude: строгая схема без seed и temperature"
+    monkeypatch.setenv("GEMINI_API_KEY", "g-test")
+    g = GeminiProvider()
+    assert g.model == "gemini-3.8-flash" and g.fallback_model == "gemini-3.5-flash-lite"
+    assert GeminiProvider("gemini-3.5-flash-lite").fallback_model is None
 
 
 def test_strict_schema_shape():

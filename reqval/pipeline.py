@@ -28,6 +28,7 @@ NOT_READY = "НЕ ГОТОВ"
 READY_WITH_REMARKS = "ГОТОВ С ОГОВОРКАМИ"
 READY = "ГОТОВ"
 INCOMPLETE = "ПРОВЕРКА НЕ ЗАВЕРШЕНА"
+FORMAL_ONLY = "ТОЛЬКО ФОРМАЛЬНАЯ ПРОВЕРКА"   # режим offline: модель не использовалась
 
 
 @dataclass
@@ -410,6 +411,10 @@ class Pipeline:
     def verdict(self, reqs: list[Requirement], findings: list[Finding], unchecked: list[str] | None = None) -> Verdict:
         complete = not unchecked and not self.failed_steps
         status = self.auto_status(findings, complete)
+        if self.llm is None and status != NOT_READY:
+            # Без модели проверены только формальные признаки: «готов» или «готов с оговорками» здесь был бы
+            # необоснованным выводом. Критичный дефект, найденный правилами, всё равно даёт «НЕ ГОТОВ».
+            status = FORMAL_ONLY
         crit = [f for f in findings if f.severity == "критичный"]
         cnt = {s: sum(1 for f in findings if f.severity == s) for s in SEVERITY_ORDER}
         gaps = ", ".join(self.failed_steps + ([f"оценка {len(unchecked)} требований"] if unchecked else []))
@@ -418,9 +423,13 @@ class Pipeline:
             READY_WITH_REMARKS: "Разработку можно начинать после согласования значительных дефектов с аналитиком.",
             READY: "Критичных и значительных дефектов не найдено — разработку можно начинать.",
             INCOMPLETE: f"Вывод о готовности сделать нельзя: часть проверки не выполнена ({gaps}). Повторите прогон.",
+            FORMAL_ONLY: "Режим offline: проверены только формальные признаки (заглушки, пустые поля, размытые слова, "
+                         "требования без идентификаторов). Вывод о готовности к разработке без проверки моделью "
+                         "сделать нельзя — запустите агента с ключом LLM.",
         }[status]
         fallback_test = ("Проектирование тест-кейсов заблокировано для требований с критичными дефектами."
-                         if crit else "Тестирование можно планировать по текущей версии.")
+                         if crit else "Вывод о готовности к тестированию без проверки моделью сделать нельзя."
+                         if status == FORMAL_ONLY else "Тестирование можно планировать по текущей версии.")
         fallback_prio = self.fallback_priorities(findings)
         if self.llm is None:
             return Verdict(status, fallback_dev, fallback_test, fallback_prio)

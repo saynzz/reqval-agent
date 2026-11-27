@@ -168,3 +168,14 @@ def test_offline_real_document_has_no_preamble():
         pytest.skip("нет docs/requirements.md")
     res = Pipeline(load_document(str(real)), None).run()
     assert all("Комплект из двух" not in r.quote for r in res.requirements)
+
+
+def test_offline_never_claims_readiness():
+    """Без модели проверены только формальные признаки — «готов» / «готов с оговорками» был бы необоснованным."""
+    from reqval.pipeline import FORMAL_ONLY, READY, READY_WITH_REMARKS
+    real = ROOT / "docs" / "requirements.md"
+    res = Pipeline(load_document(str(real)), None).run()
+    assert res.verdict.status == FORMAL_ONLY and res.verdict.status not in (READY, READY_WITH_REMARKS)
+    assert "без проверки моделью сделать нельзя" in res.verdict.development
+    md = build_markdown(res)
+    assert f"**Решение: {FORMAL_ONLY}**" in md
