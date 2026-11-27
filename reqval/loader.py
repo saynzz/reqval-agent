@@ -6,11 +6,19 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import statistics
+import zipfile
 from pathlib import Path
 
 from .models import Document, Line
+
+log = logging.getLogger("reqval")
+
+
+class DocumentError(ValueError):
+    """Файл нельзя прочитать как документ требований. Сообщение — для человека, на русском."""
 
 SECTION_SEP = " › "
 
@@ -295,22 +303,150 @@ def _load_docx(path: Path) -> tuple[list[Line], str | None]:
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Определение формата и кодировки, защита от повреждённых файлов
+# ---------------------------------------------------------------------------
+
+SUPPORTED = {".pdf": "pdf", ".docx": "docx", ".md": "md", ".markdown": "md", ".txt": "txt", "": "txt"}
+FORMAT_NAMES = {"pdf": "PDF", "docx": "DOCX", "md": "Markdown", "txt": "текст"}
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f]")
+MAX_CONTROL_SHARE = 0.01   # больше 1 % управляющих символов — это не текст
+
+
+def sniff_format(head: bytes) -> str | None:
+    """Формат по содержимому: pdf / docx / doc / zip / None (похоже на текст)."""
+    if head.lstrip()[:5] == b"%PDF-":
+        return "pdf"
+    if head[:4] == b"PK\x03\x04":
+        return "zip"           # DOCX — это zip; что внутри, проверяется отдельно
+    if head[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return "doc"           # старый Word (OLE)
+    if head[:5] == b"{\\rtf":
+        return "rtf"
+    return None
+
+
+def _is_docx(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as z:
+            return "word/document.xml" in z.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
+def decode_text(data: bytes) -> tuple[str, str]:
+    """Байты → текст. BOM убирается; если не UTF-8 — пробуется Windows-1251 (частый случай для русских файлов
+    из Windows). Возвращает (текст, кодировка)."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", errors="strict"), "utf-8 (с BOM)"
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16"), "utf-16"
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    text = data.decode("cp1251", errors="strict") if _looks_cp1251(data) else None
+    if text is None:
+        raise DocumentError("Не удалось определить кодировку файла: это не UTF-8 и не Windows-1251. "
+                            "Сохраните документ в UTF-8.")
+    return text, "windows-1251"
+
+
+def _looks_cp1251(data: bytes) -> bool:
+    try:
+        text = data.decode("cp1251")
+    except UnicodeDecodeError:
+        return False
+    # Любые байты 0x80–0xFF «декодируются» в cp1251, поэтому проверяем, что получился именно русский текст:
+    # кириллица — хотя бы половина букв, и почти вся она из обычного русского алфавита (а не Ѓ, Ќ, Џ, ђ…).
+    letters = [c for c in text if c.isalpha()]
+    cyr = [c for c in letters if "\u0400" <= c <= "\u04ff"]
+    russian = sum(1 for c in cyr if "а" <= c.lower() <= "я" or c in "ёЁ")
+    return bool(cyr) and len(cyr) / len(letters) >= 0.5 and russian / len(cyr) >= 0.9
+
+
+def _check_is_text(text: str) -> None:
+    sample = text[:200_000]
+    if not sample.strip():
+        return
+    bad = len(CONTROL_RE.findall(sample))
+    if "\x00" in sample or bad / len(sample) > MAX_CONTROL_SHARE:
+        raise DocumentError("Файл не похож на текстовый документ: внутри двоичные данные. "
+                            "Проверьте, что передан нужный файл (PDF, DOCX, Markdown или TXT).")
+
+
+def _reason(e: Exception) -> str:
+    msg = str(e).strip().splitlines()[0][:160] if str(e).strip() else ""
+    return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+
+
 def load_document(path: str) -> Document:
+    """Чтение документа. Любая проблема с файлом — DocumentError (ValueError) с понятным сообщением:
+    CLI печатает его и выходит с кодом 2, без трассировки Python."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Файл не найден: {path}")
+    if p.is_dir():
+        raise DocumentError(f"Указана папка, а не файл: {path}")
+    try:
+        with open(p, "rb") as f:
+            head = f.read(4096)
+    except OSError as e:
+        raise DocumentError(f"Файл не удаётся открыть: {_reason(e)}") from e
+    if not head:
+        raise DocumentError("Файл пустой (0 байт)")
+
+    notes: list[str] = []
     ext = p.suffix.lower()
-    if ext == ".pdf":
-        lines, title, fmt = *_load_pdf(p), "pdf"
-    elif ext == ".docx":
-        lines, title, fmt = *_load_docx(p), "docx"
-    elif ext in (".md", ".markdown"):
-        lines, title, fmt = *_load_markdown(p.read_text(encoding="utf-8")), "md"
-    elif ext in (".txt", ""):
-        lines, title, fmt = *_load_txt(p.read_text(encoding="utf-8")), "txt"
-    else:
-        raise ValueError(f"Неподдерживаемый формат: {ext}. Поддерживаются .pdf, .docx, .md, .txt")
+    by_ext = SUPPORTED.get(ext)
+    sniffed = sniff_format(head)
+    if sniffed == "zip":
+        sniffed = "docx" if _is_docx(p) else "zip"
+    if sniffed == "doc":
+        raise DocumentError("Это файл старого формата Word (.doc). Сохраните его как .docx или PDF.")
+    if sniffed == "rtf":
+        raise DocumentError("Это файл RTF. Сохраните его как .docx, PDF или Markdown.")
+    if sniffed == "zip":
+        raise DocumentError("Это zip-архив, а не документ DOCX" + (" (файл DOCX повреждён?)" if ext == ".docx" else "")
+                            + ". Нужен PDF, DOCX, Markdown или TXT.")
+    if by_ext is None and sniffed is None:
+        raise DocumentError(f"Неподдерживаемый формат: {ext}. Поддерживаются .pdf, .docx, .md, .txt")
+
+    fmt = sniffed or by_ext
+    if sniffed is None and by_ext in ("pdf", "docx"):
+        raise DocumentError(f"Файл с расширением {ext} не является {FORMAT_NAMES[by_ext]}: "
+                            "содержимое повреждено или это другой формат.")
+    if by_ext and sniffed and by_ext != sniffed:
+        msg = (f"расширение {ext or '(нет)'}, а по содержимому это {FORMAT_NAMES[sniffed]} — "
+               f"файл прочитан как {FORMAT_NAMES[sniffed]}")
+        log.warning("Документ: %s", msg)
+        notes.append(msg)
+
+    try:
+        if fmt == "pdf":
+            lines, title = _load_pdf(p)
+        elif fmt == "docx":
+            lines, title = _load_docx(p)
+        else:
+            text, enc = decode_text(p.read_bytes())
+            if not enc.startswith("utf-8"):        # BOM убирается молча: он безвреден
+                log.warning("Документ: кодировка %s", enc)
+                notes.append(f"кодировка {enc} — прочитано с перекодировкой в UTF-8")
+            _check_is_text(text)
+            lines, title = _load_markdown(text) if fmt == "md" else _load_txt(text)
+    except DocumentError:
+        raise
+    except ValueError as e:      # понятные сообщения загрузчиков (скан PDF и т.п.)
+        if type(e) is ValueError:
+            raise DocumentError(str(e)) from e
+        raise DocumentError(f"Файл {FORMAT_NAMES[fmt]} не удаётся прочитать: {_reason(e)}") from e
+    except Exception as e:  # noqa: BLE001 — повреждённый PDF/DOCX: pdfminer, zipfile, lxml бросают свои исключения
+        hint = {"pdf": "PDF повреждён, обрезан или защищён паролем",
+                "docx": "DOCX повреждён или сохранён не полностью"}.get(fmt, "файл повреждён")
+        if "password" in type(e).__name__.lower() or "encrypt" in str(e).lower():
+            hint = "PDF защищён паролем — снимите защиту или сохраните копию без пароля"
+        raise DocumentError(f"Не удалось прочитать документ: {hint} ({_reason(e)}).") from e
 
     if not any(l.text.strip() for l in lines):
-        raise ValueError("Документ пустой: текст не извлечён")
-    return Document(name=title or p.stem, path=str(p), fmt=fmt, sha256=_sha256(p), lines=lines)
+        raise DocumentError("Документ пустой: текст не извлечён")
+    return Document(name=title or p.stem, path=str(p), fmt=fmt, sha256=_sha256(p), lines=lines, notes=notes)

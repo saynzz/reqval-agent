@@ -71,6 +71,12 @@ def main(argv: list[str] | None = None) -> int:
     except (LLMError, FileNotFoundError, ValueError) as e:
         log.error("%s", e)
         return 2
+    except PermissionError as e:
+        log.error("Нет прав на запись: %s — укажите другой путь для отчёта", e.filename or e)
+        return 2
+    except OSError as e:
+        log.error("Ошибка файловой системы: %s", e)
+        return 2
     for p in paths:
         log.info("Отчёт: %s", p)
     if provider is not None and provider.journal_path:

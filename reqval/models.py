@@ -30,6 +30,7 @@ class Document:
     fmt: str                # md / pdf / docx / txt
     sha256: str
     lines: list[Line] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)   # что агент поправил при чтении (кодировка, формат)
 
     def numbered_text(self) -> str:
         """Текст с номерами строк — так модель видит документ и ссылается на места."""

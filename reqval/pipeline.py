@@ -101,7 +101,7 @@ class Pipeline:
         self.batch_size = batch_size
         self.coverage = coverage      # добирать строки, пропущенные моделью при нарезке
         self.anchor = Anchorer(doc)
-        self.notes: list[str] = []
+        self.notes: list[str] = [f"Чтение документа: {n}" for n in doc.notes]
         self.rejected: list[Rejected] = []
         self.failed_steps: list[str] = []
         self.extraction = "правила" if provider is None else "LLM"
